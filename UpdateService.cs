@@ -18,8 +18,11 @@ namespace NetworkRescue
 
     public static class UpdateService
     {
+        internal const string DefaultRepository = "shangguanyiyu0011/NetworkRescue";
         private const int MaximumBodyBytes = 512 * 1024;
         private const int TimeoutMilliseconds = 8000;
+
+        internal static string RepositoryOrDefault(string repository) { return String.IsNullOrWhiteSpace(repository) ? DefaultRepository : repository.Trim(); }
 
         public static bool TryNormalizeRepository(string input, out string repository)
         {

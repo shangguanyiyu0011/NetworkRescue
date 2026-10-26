@@ -37,7 +37,7 @@ namespace NetworkRescue
         private BackupOperationInfo incomplete;
         private SiteDiagnosticReport siteReport;
         private UpdateCheckResult updateResult;
-        private string updateRepository = "";
+        private string updateRepository = UpdateService.DefaultRepository;
         private MonitoringSession monitoring;
         private NetworkChangeSnapshot healthyConfiguration;
         private DiagnosticReport healthyReport;
@@ -152,9 +152,9 @@ namespace NetworkRescue
                     if (monitoring == null) { Emit("notice", U("native.notReady")); break; }
                     SaveRedactedReport(BuildMonitoringText(monitoring, U)); break;
                 case "checkUpdates":
-                    string source = OptionalText(message, "repository", 160), normalized;
-                    if (source.Length > 0 && !UpdateService.TryNormalizeRepository(source, out normalized)) throw new InvalidDataException(U("updateRepositoryHint"));
-                    updateRepository = source.Trim(); SaveSettings(); updateResult = null;
+                    string source = UpdateService.RepositoryOrDefault(OptionalText(message, "repository", 160)), normalized;
+                    if (!UpdateService.TryNormalizeRepository(source, out normalized)) throw new InvalidDataException(U("updateRepositoryHint"));
+                    updateRepository = normalized; SaveSettings(); updateResult = null;
                     await Run("checkUpdates", async delegate(CancellationToken token)
                     {
                         updateResult = await UpdateService.CheckAsync(updateRepository, DisplayVersion, token);
@@ -856,7 +856,7 @@ namespace NetworkRescue
                     if (data.TryGetValue("language", out value)) I18n.SetLanguage(value);
                     if (data.TryGetValue("mode", out value) && (value == "beginner" || value == "advanced")) mode = value;
                     if (data.TryGetValue("theme", out value) && (value == "light" || value == "dark")) theme = value;
-                    string normalized; if (data.TryGetValue("updateRepository", out value) && UpdateService.TryNormalizeRepository(value, out normalized)) updateRepository = normalized;
+                    if (data.TryGetValue("updateRepository", out value)) updateRepository = UpdateService.RepositoryOrDefault(value);
                     Guid reviewed; if (data.TryGetValue("reviewedOperationId", out value) && Guid.TryParse(value, out reviewed)) reviewedOperationId = reviewed.ToString("D");
                 }
             }

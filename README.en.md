@@ -26,6 +26,7 @@ Extract the entire ZIP to a writable local folder and open `NetworkRescue.exe`. 
 - **Healthy snapshots and saved settings:** up to 20 snapshots and 20 complete monitoring plans. A healthy diagnosis card can save an automatically named snapshot; Settings also offers manual naming. Selecting saved settings fills inputs without starting monitoring.
 - **Reports and backups:** review a redacted preview before saving locally; nothing is automatically uploaded. Repairs save a backup and support validated local restoration and before/after comparisons.
 - **Speed test:** single-connection download/upload, HTTP round trips and actual sample curves to Cloudflare's endpoint, describing that path rather than guaranteed ISP bandwidth.
+- **Update checks:** the official `shangguanyiyu0011/NetworkRescue` repository is configured by default. Empty older settings are filled automatically; non-empty custom repositories are retained. Checks and downloads remain user-initiated, without automatic network checks or installation.
 - **Ten languages, two themes:** Simplified/Traditional Chinese, English, Japanese, Korean, German, French, Spanish, Portuguese and Russian; Warm Day and Quiet Night themes. Usage and offline troubleshooting help remain readable without Internet access.
 
 ## Repair scope
@@ -53,7 +54,7 @@ Settings, backups, history and workspace data remain under `%LOCALAPPDATA%\Netwo
 
 ## Screenshots
 
-These show the **real WPF UI with synthetic demonstration data**. They illustrate layout and interactions, not actual public-network diagnosis or speed-test conclusions.
+These five images show the **1.0.0 WPF UI from the initial upload, with synthetic demonstration data**. The finalized release retains the main layout with revised update-setting notices; screenshots have not been retaken. They are not public-network diagnosis or speed-test conclusions.
 
 ![Beginner diagnosis, Warm Day](docs/screenshots/diagnosis-beginner-light.png)
 
@@ -84,7 +85,7 @@ Use the matching [v1.0.0 source tag](https://github.com/shangguanyiyu0011/Networ
 
 Builds use system C# 5 / .NET Framework 4.8 and WPF references, with no NuGet restore or runtime download. The default build runs 16 C# suites and writes `build-native-x64` / `build-native-x86`; packages go to `dist`. Calling `publish.ps1 -Architecture x64` or `x86` directly first runs the full build/checks. The scripts do not upload or publish releases.
 
-The 1.0.0 promotion changes release metadata and localized notices without changing network logic. Both formal architectures passed 16 suites: 3,277 assertions for x64 and 3,275 for x86. RC5's 1,513 independent integration assertions retain their original EXE binding and were not rerun against the formal EXEs. No new VM repair, pure 32-bit OS or long-duration validation is claimed. See the [validation record](docs/RELEASE-READINESS.v1.md).
+The finalized 1.0.0 release configures the official update source and fills older empty settings. Product version remains 1.0.0 and assembly/file version 1.0.0.0. All 16 suites passed for each architecture: 3318 assertions on x64 and 3316 on x86, plus a live GitHub update query. Initial-upload and RC5 evidence retains its historical binary bindings. See the [validation record](docs/RELEASE-READINESS.v1.md).
 
 ## License and feedback
 

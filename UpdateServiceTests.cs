@@ -20,6 +20,10 @@ namespace NetworkRescue
         private static void InputAndParser()
         {
             string normalized;
+            foreach (string value in new[] { (string)null, "", " \t\r\n " })
+                Assert(UpdateService.RepositoryOrDefault(value) == "shangguanyiyu0011/NetworkRescue", "missing or blank application source selects the official repository");
+            Assert(UpdateService.RepositoryOrDefault(" example-owner/network-rescue ") == Repository, "custom application source is retained and trimmed");
+            Assert(UpdateService.RepositoryOrDefault("https://evil.test/repo") == "https://evil.test/repo", "invalid nonempty source remains available for explicit validation");
             Assert(UpdateService.TryNormalizeRepository(" example-owner/network-rescue ", out normalized) && normalized == Repository, "trim owner/repo");
             foreach (string value in new[] { null, "", "owner", "https://github.com/owner/repo", "owner/repo?token=secret", "owner/repo#fragment", "user:password/repo", "owner//repo", "../repo", "owner/..", "owner/a..b", "-owner/repo", "owner-/repo", "owner--name/repo", "owner/repo/", "owner/repo\\file", "owner/re po", "owner/%72epo", "owner/.", "é/repo", new string('a', 40) + "/repo", "owner/" + new string('a', 101) })
                 Assert(!UpdateService.TryNormalizeRepository(value, out normalized), "reject repository " + value);

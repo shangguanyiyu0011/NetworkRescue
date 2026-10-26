@@ -60,7 +60,7 @@ namespace NetworkRescue
         private bool monitorProxy = true, speedProxy;
         private string advancedOutput = "", adaptersOutput = "", connectionsOutput = "";
         private string inputPage;
-        private string updateRepository = "", adapterTimestamp = "", connectionTimestamp = "";
+        private string updateRepository = UpdateService.DefaultRepository, adapterTimestamp = "", connectionTimestamp = "";
         private sealed class MonitorRow
         {
             public string Id, Host, Method = "https"; public bool Proxy = true;
@@ -127,7 +127,7 @@ namespace NetworkRescue
                     if (Languages.Contains(nextLanguage) && language != nextLanguage) { language = nextLanguage; ClearDynamic(); }
                     if (mode != nextMode) { mode = nextMode; chosen.Clear(); currentChosen.Clear(); beginnerChosen.Clear(); specialChosen.Clear(); foreach (Dictionary<string, object> action in Actions(true)) beginnerChosen.Add(ActionKey(action)); page = "diagnosis"; }
                     if (S(data, "version").Length > 0) version = S(data, "version");
-                    if (data.ContainsKey("updateRepository")) { if (!themeOnlySwitch) updateRepository = S(data, "updateRepository"); repositoryInput = null; }
+                    if (data.ContainsKey("updateRepository")) { if (!themeOnlySwitch) updateRepository = UpdateService.RepositoryOrDefault(S(data, "updateRepository")); repositoryInput = null; }
                     if (data.ContainsKey("monitorGateway")) monitorGateway = S(data, "monitorGateway");
                     if (data.ContainsKey("healthProfiles")) healthProfiles = A(V(data, "healthProfiles"));
                     if (data.ContainsKey("monitorPlans")) monitorPlans = A(V(data, "monitorPlans"));
@@ -1095,7 +1095,7 @@ namespace NetworkRescue
             if (page == "monitor" && intervalInput != null) { foreach (MonitorRow row in monitorTargets) { if (row.HostInput == null) continue; row.Host = row.HostInput.Text.Trim(); row.Method = row.MethodInput.SelectedIndex == 1 ? "icmp" : "https"; row.Proxy = row.RouteInput.SelectedIndex == 0; } monitorInterval = intervalInput.Text.Trim(); monitorCount = countInput.Text.Trim(); if (monitorTargets.Count > 0) { monitorHost = monitorTargets[0].Host; monitorMethod = monitorTargets[0].Method; monitorProxy = monitorTargets[0].Proxy; } }
             if (page == "monitor" && monitorPlanNameInput != null) monitorPlanName = monitorPlanNameInput.Text.Trim();
             if (page == "dnscompare" && hostInput != null) { dnsHost = hostInput.Text.Trim(); dnsServers = dnsInput.Text.Trim(); }
-            if (page == "settings" && repositoryInput != null) updateRepository = repositoryInput.Text.Trim();
+            if (page == "settings" && repositoryInput != null) { updateRepository = UpdateService.RepositoryOrDefault(repositoryInput.Text); repositoryInput.Text = updateRepository; }
             if (page == "settings" && healthProfileNameInput != null) healthProfileName = healthProfileNameInput.Text.Trim();
         }
         private void ClearNotice() { noticeText = null; noticeError = false; RenderNotice(); }

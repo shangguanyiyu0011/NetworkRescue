@@ -494,6 +494,21 @@ namespace NetworkRescue
                 Check(typeof(NativeController).GetField("operation", flags).GetValue(controller) == null, "Invalid update repository cannot start a check");
                 Check(typeof(NativeController).GetField("updateRepository", flags).GetValue(controller) == null, "Invalid update repository cannot replace configuration");
             }
+            string guardedDirectory = Path.Combine(Path.GetTempPath(), "NetworkRescueUpdateSource-" + Guid.NewGuid().ToString("N"));
+            File.WriteAllText(guardedDirectory, "fixture blocks persistence before any network request");
+            typeof(NativeController).GetField("settingsRoot", flags).SetValue(controller, guardedDirectory);
+            try
+            {
+                foreach (string repository in new[] { (string)null, "", " \t ", " custom-owner/project " })
+                {
+                    bool blocked = false;
+                    try { ((Task)typeof(NativeController).GetMethod("Dispatch", flags).Invoke(controller, new object[] { new Dictionary<string, object> { { "command", "checkUpdates" }, { "repository", repository } } })).GetAwaiter().GetResult(); }
+                    catch (IOException) { blocked = true; }
+                    Check(blocked && (string)typeof(NativeController).GetField("updateRepository", flags).GetValue(controller) == (String.IsNullOrWhiteSpace(repository) ? UpdateService.DefaultRepository : "custom-owner/project"), "Explicit blank checks use official source and custom checks retain their source before persistence");
+                    Check(typeof(NativeController).GetField("operation", flags).GetValue(controller) == null, "Failed settings persistence prevents the update network request");
+                }
+            }
+            finally { File.Delete(guardedDirectory); }
             foreach (UpdateCheckResult result in new[] {
                 (UpdateCheckResult)null,
                 new UpdateCheckResult { Status = "UpToDate", Repository = "owner/repo", ReleaseUrl = "https://github.com/owner/repo/releases/tag/v1.0.0" },

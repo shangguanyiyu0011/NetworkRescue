@@ -18,7 +18,7 @@
 
 - 诊断按需访问 Microsoft、Google、百度等测试或网页端点；网站专项/持续监测请求用户指定目标，DNS 对比向用户指定 DNS 地址发出原始查询。
 - 宽带测速使用 `https://speed.cloudflare.com/`，上传合成数据而不读取用户文件。端点和网络路径会影响结果。
-- 用户配置 GitHub `owner/repo` 后手动检查稳定发布时访问 GitHub Releases API；只打开经校验的同仓库 HTTPS 发布页，不自动下载或安装。URL 校验不是下载签名验证。
+- 默认官方 GitHub `shangguanyiyu0011/NetworkRescue`，旧空配置补全、非空自定义保留；用户手动检查稳定发布时才访问 GitHub Releases API；只打开经校验的同仓库 HTTPS 发布页，不自动下载或安装。URL 校验不是下载签名验证。
 
 这些服务是测量/信息对象，不是打包依赖，不代表合作或背书。HTTP 保留证书校验、取消/头部边界，不发默认或代理凭据；忽略 HTTP 代理不等于绕过 VPN。
 
