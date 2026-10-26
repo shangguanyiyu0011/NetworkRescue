@@ -1,0 +1,28 @@
+name: Build and package
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: [x64, x86]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Build and test
+        shell: powershell
+        run: .\build.ps1 -Architecture ${{ matrix.architecture }}
+      - name: Package checked build
+        shell: powershell
+        run: .\publish.ps1 -Architecture ${{ matrix.architecture }} -SkipBuild

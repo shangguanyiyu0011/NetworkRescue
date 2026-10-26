@@ -1,0 +1,92 @@
+name: 故障反馈 / Bug report
+description: 提交可复现问题；仅提供必要的脱敏信息。
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请先查看同版本发布说明，并注明完整版本，例如 `1.0.0`。只提交最小必要证据。
+        不要填写密钥、订阅链接、密码、原始 IP、SSID、代理地址、完整敏感网址或上传 `.nrb`、`.nrh`、`.nrw`、settings、未脱敏报告。
+        报告可在软件中先预览脱敏结果，再保存并自行检查后附上；软件不会自动上传。
+  - type: input
+    id: version
+    attributes:
+      label: 应用版本 / App version
+      description: 填写完整版本；若是自行构建，请注明对应 tag/commit。
+      placeholder: "1.0.0；tag v1.0.0；assembly 1.0.0.0"
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows 版本 / Windows version
+      description: 仅填系统版本与内部版本号，不填用户名或计算机名。
+      placeholder: "Windows 10 22H2 / Windows 11，内部版本号"
+    validations:
+      required: true
+  - type: dropdown
+    id: os_architecture
+    attributes:
+      label: 系统架构 / OS architecture
+      options:
+        - x64 / 64-bit
+        - x86 / 32-bit
+        - ARM64 或其他（超出当前支持基线）
+        - 不确定 / Unknown
+    validations:
+      required: true
+  - type: dropdown
+    id: package_architecture
+    attributes:
+      label: 使用的程序包 / Package architecture
+      options:
+        - win-x64
+        - win-x86
+        - 不确定 / Unknown
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤 / Steps to reproduce
+      description: 说明使用哪个页面和操作；网站问题可使用可公开的示例域名，不填敏感完整 URL。
+      placeholder: |
+        1. 完整解压后打开……
+        2. 选择……
+        3. 出现……
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期结果 / Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果 / Actual behavior
+      description: 填写状态或错误码；如涉及修复，请注明逐项结果及是否提示重启/待确认，不附原始配置。
+    validations:
+      required: true
+  - type: textarea
+    id: network_mode
+    attributes:
+      label: 代理或 VPN 类型与模式 / Proxy or VPN type and mode
+      description: 仅说明是否使用、HTTP/SOCKS/PAC/TUN/其他类型、全局/规则/分流模式及测试选择的直连/系统代理路径。不填地址、账号、订阅或密钥；不确定可写“不确定”。
+      placeholder: "例如：TUN 规则模式；持续监测选择 HTTPS + 系统代理。或：未使用代理/VPN。"
+    validations:
+      required: true
+  - type: textarea
+    id: redacted_report
+    attributes:
+      label: 已检查的脱敏报告（可选）/ Reviewed redacted report (optional)
+      description: 可粘贴最小相关片段或附上已检查的脱敏文本；无需提供原始 IP、SSID、凭据或备份。
+      render: text
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 分享前检查 / Before sharing
+      options:
+        - label: 我已检查填写内容及附件，不包含密钥、订阅、密码、原始 IP、SSID、代理地址或私人备份。
+          required: true
