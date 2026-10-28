@@ -10,6 +10,36 @@ using System.Threading;
 namespace NetworkRescue
 {
     public enum SpeedTestPhase { Latency = 0, Download = 1, Upload = 2 }
+    public enum LatencySampleState { Success = 0, Failed = 1 }
+    public enum LatencyMeasurementStatus { NotStarted = 0, Sampling = 1, InsufficientSamples = 2, Ready = 3, Interrupted = 4 }
+
+    internal sealed class LatencySample
+    {
+        public SpeedTestPhase Phase;
+        public DateTime StartedUtc;
+        public double PhaseElapsedSeconds;
+        public double? Milliseconds;
+        public LatencySampleState State;
+        public string FailureCode = "";
+        public LatencySample Copy() { return (LatencySample)MemberwiseClone(); }
+    }
+
+    internal sealed class LatencyStatistics
+    {
+        public LatencyMeasurementStatus Status;
+        public int SuccessCount;
+        public int FailureCount;
+        public double? MedianMs;
+        public double? P95Ms;
+        public List<LatencySample> Samples = new List<LatencySample>();
+        public LatencyStatistics Copy()
+        {
+            var copy = (LatencyStatistics)MemberwiseClone();
+            copy.Samples = new List<LatencySample>();
+            foreach (var sample in Samples) copy.Samples.Add(sample.Copy());
+            return copy;
+        }
+    }
 
     internal sealed class SpeedTestResult
     {
@@ -23,19 +53,32 @@ namespace NetworkRescue
         public double? DownloadMbps;
         public double? UploadMbps;
         public double? LatencyMs;
+        public LatencyStatistics IdleLatency = new LatencyStatistics();
+        public LatencyStatistics DownloadLatency = new LatencyStatistics();
+        public LatencyStatistics UploadLatency = new LatencyStatistics();
+        public double? DownloadLatencyDeltaMs;
+        public double? UploadLatencyDeltaMs;
         public SpeedTestPhase Phase;
         public double PhaseElapsedSeconds;
         public double? PhaseAverageMbps;
         public bool PhaseCompleted;
         public bool Completed;
         public long TotalBytes { get { return DownloadBytes + UploadBytes; } }
-        public SpeedTestResult Copy() { return (SpeedTestResult)MemberwiseClone(); }
+        public SpeedTestResult Copy()
+        {
+            var copy = (SpeedTestResult)MemberwiseClone();
+            copy.IdleLatency = IdleLatency.Copy(); copy.DownloadLatency = DownloadLatency.Copy(); copy.UploadLatency = UploadLatency.Copy();
+            return copy;
+        }
     }
 
     internal sealed class SpeedTest
     {
         internal const long MiB = 1024 * 1024;
         internal const long MaximumPayloadBytes = 73 * MiB;
+        internal const int MinimumLatencySamples = 3;
+        private const int ProbeIntervalMilliseconds = 500;
+        private const int ProbeTimeoutMilliseconds = 1500;
         private readonly Uri endpoint;
         private readonly long downLimit;
         private readonly long upLimit;
@@ -73,9 +116,14 @@ namespace NetworkRescue
                 try
                 {
                     StartPhase(SpeedTestPhase.Latency, I18n.T("测量 HTTP 往返延迟"));
-                    var samples = new List<double>();
-                    for (int i = 0; i < 5; i++) samples.Add(Download(0, deadline.Token));
-                    result.LatencyMs = Median(samples.ToArray());
+                    Exception idleError = null;
+                    for (int i = 0; i < 5; i++)
+                    {
+                        Exception error = Probe(SpeedTestPhase.Latency, deadline.Token, null);
+                        if (error != null) idleError = error;
+                    }
+                    FinishLatency(SpeedTestPhase.Latency, false);
+                    if (result.IdleLatency.SuccessCount < MinimumLatencySamples) throw idleError ?? new IOException(I18n.T("至少需要一个延迟样本。"));
                     activePhase = 1;
                     Measure(false, downLimit, deadline.Token);
                     activePhase = 0;
@@ -95,6 +143,11 @@ namespace NetworkRescue
                     else { result.State = I18n.T("测速未完成"); result.Detail = I18n.T("当前阶段未完成，速度保持为空。") + FriendlyError(ex); }
                 }
             }
+            lock (reportGate)
+            {
+                var statistics = Statistics(result.Phase);
+                if (statistics.Status == LatencyMeasurementStatus.Sampling) FinishLatency(result.Phase, true);
+            }
             if (phaseWatch != null) phaseWatch.Stop();
             elapsed.Stop(); Report(true); return result.Copy();
         }
@@ -104,7 +157,12 @@ namespace NetworkRescue
             StartPhase(upload ? SpeedTestPhase.Upload : SpeedTestPhase.Download, upload ? I18n.T("测量上传速度") : I18n.T("测量下载速度"));
             int size = (int)Math.Min(256 * 1024, limit);
             using (var phase = CancellationTokenSource.CreateLinkedTokenSource(token))
+            using (var probeStop = CancellationTokenSource.CreateLinkedTokenSource(phase.Token))
             {
+                string probeGroup = "NetworkRescue-latency-" + Guid.NewGuid().ToString("N");
+                var probeThread = new Thread(delegate() { ProbeLoop(upload ? SpeedTestPhase.Upload : SpeedTestPhase.Download, probeGroup, probeStop.Token); });
+                probeThread.IsBackground = true;
+                bool probeStarted = false, transferEnded = false;
                 Exception reportError = null;
                 var reporter = progress == null ? null : new Timer(delegate
                 {
@@ -114,6 +172,8 @@ namespace NetworkRescue
                 try
                 {
                     phase.CancelAfter(targetMilliseconds);
+                    probeThread.Start();
+                    probeStarted = true;
                     for (int requests = 0; requests < 100 && phaseConfirmedBytes < limit; requests++)
                     {
                         token.ThrowIfCancellationRequested();
@@ -133,10 +193,14 @@ namespace NetworkRescue
                         // Aim at approximately one second per sample, capped to bound memory and cancellation latency.
                         size = (int)Math.Max(64 * 1024, Math.Min(upload ? 4 * MiB : 8 * MiB, count * 1000.0 / Math.Max(1, duration)));
                     }
+                    transferEnded = true;
                 }
                 finally
                 {
                     lock (reportGate) phaseWatch.Stop();
+                    probeStop.Cancel();
+                    if (probeStarted) probeThread.Join();
+                    FinishLatency(upload ? SpeedTestPhase.Upload : SpeedTestPhase.Download, token.IsCancellationRequested || !transferEnded);
                     if (reporter != null)
                         using (var stopped = new ManualResetEvent(false)) { reporter.Dispose(stopped); stopped.WaitOne(); }
                 }
@@ -151,10 +215,11 @@ namespace NetworkRescue
             Report(true);
         }
 
-        private HttpWebRequest Request(string path, string method)
+        private HttpWebRequest Request(string path, string method, string connectionGroup)
         {
             var request = (HttpWebRequest)WebRequest.Create(new Uri(endpoint, path));
             request.Method = method;
+            if (connectionGroup != null) request.ConnectionGroupName = connectionGroup;
             request.Proxy = followProxy ? WebRequest.GetSystemWebProxy() : null;
             if (request.Proxy != null) request.Proxy.Credentials = null;
             request.UseDefaultCredentials = false; request.Credentials = null; request.PreAuthenticate = false;
@@ -168,13 +233,16 @@ namespace NetworkRescue
             return request;
         }
 
-        private double Download(int bytes, CancellationToken token)
+        private double Download(int bytes, CancellationToken token) { return Download(bytes, token, null); }
+        private double Download(int bytes, CancellationToken token, string connectionGroup)
         {
             token.ThrowIfCancellationRequested();
-            var request = Request("__down?bytes=" + bytes + "&cache=" + Guid.NewGuid().ToString("N"), "GET");
+            var request = Request("__down?bytes=" + bytes + "&cache=" + Guid.NewGuid().ToString("N"), "GET", connectionGroup);
+            int timeoutMs = bytes == 0 ? ProbeTimeoutMilliseconds : 8000;
+            request.Timeout = timeoutMs; request.ReadWriteTimeout = timeoutMs;
             var watch = Stopwatch.StartNew();
             using (token.Register(delegate { request.Abort(); }))
-            using (var timeout = new Timer(delegate { request.Abort(); }, null, 8000, Timeout.Infinite))
+            using (var timeout = new Timer(delegate { request.Abort(); }, null, timeoutMs, Timeout.Infinite))
             using (var response = (HttpWebResponse)request.GetResponse())
             {
                 CheckResponse(response);
@@ -188,7 +256,7 @@ namespace NetworkRescue
                     {
                         AddTraffic(read, false); received += read;
                         if (received > bytes) throw new IOException(I18n.T("下载响应超过请求上限，已停止。"));
-                        token.ThrowIfCancellationRequested(); Report(false);
+                        token.ThrowIfCancellationRequested(); if (bytes > 0) Report(false);
                     }
                 }
                 if (received != bytes) throw new IOException(I18n.T("下载内容不完整，已拒绝此样本。"));
@@ -201,7 +269,7 @@ namespace NetworkRescue
             token.ThrowIfCancellationRequested();
             var buffer = new byte[Math.Min(64 * 1024, bytes)];
             using (var random = RandomNumberGenerator.Create()) random.GetBytes(buffer);
-            var request = Request("__up", "POST");
+            var request = Request("__up", "POST", null);
             request.ContentType = "application/octet-stream"; request.ContentLength = bytes;
             var watch = Stopwatch.StartNew();
             using (token.Register(delegate { request.Abort(); }))
@@ -241,7 +309,7 @@ namespace NetworkRescue
             {
                 int split = ray.LastIndexOf('-');
                 string colo = split >= 0 ? ray.Substring(split + 1) : "";
-                if (colo.Length == 3 && IsAsciiLetters(colo)) result.Node = endpoint.Host + " · Cloudflare " + colo.ToUpperInvariant();
+                if (colo.Length == 3 && IsAsciiLetters(colo)) lock (reportGate) result.Node = endpoint.Host + " · Cloudflare " + colo.ToUpperInvariant();
             }
         }
 
@@ -249,6 +317,89 @@ namespace NetworkRescue
         {
             foreach (char c in value) if (!(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z')) return false;
             return true;
+        }
+
+        private LatencyStatistics Statistics(SpeedTestPhase phase)
+        {
+            return phase == SpeedTestPhase.Latency ? result.IdleLatency : phase == SpeedTestPhase.Download ? result.DownloadLatency : result.UploadLatency;
+        }
+
+        // Only this worker issues loaded probes. A slow probe never queues more probes.
+        private void ProbeLoop(SpeedTestPhase phase, string connectionGroup, CancellationToken token)
+        {
+            try
+            {
+                while (!token.IsCancellationRequested)
+                {
+                    var interval = Stopwatch.StartNew();
+                    Probe(phase, token, connectionGroup);
+                    int wait = Math.Max(0, ProbeIntervalMilliseconds - (int)interval.ElapsedMilliseconds);
+                    if (token.WaitHandle.WaitOne(wait)) break;
+                }
+            }
+            catch (OperationCanceledException) { }
+            finally
+            {
+                // Closing our private group does not disturb throughput or other application requests.
+                try { ServicePointManager.FindServicePoint(endpoint, followProxy ? WebRequest.GetSystemWebProxy() : null).CloseConnectionGroup(connectionGroup); }
+                catch (Exception) { /* Request disposal already closes every active response. */ }
+            }
+        }
+
+        private Exception Probe(SpeedTestPhase phase, CancellationToken token, string connectionGroup)
+        {
+            token.ThrowIfCancellationRequested();
+            var sample = new LatencySample { Phase = phase, StartedUtc = DateTime.UtcNow };
+            lock (reportGate) sample.PhaseElapsedSeconds = phaseWatch.Elapsed.TotalSeconds;
+            Exception error = null;
+            try { sample.Milliseconds = Download(0, token, connectionGroup); sample.State = LatencySampleState.Success; }
+            catch (Exception ex)
+            {
+                token.ThrowIfCancellationRequested();
+                error = ex; sample.State = LatencySampleState.Failed;
+                var web = ex as WebException;
+                sample.FailureCode = web == null ? "InvalidResponse" : web.Status == WebExceptionStatus.Timeout || web.Status == WebExceptionStatus.RequestCanceled ? "Timeout" : web.Status == WebExceptionStatus.ProtocolError ? "ProtocolError" : "TransportError";
+                if (web != null && web.Response != null) web.Response.Close();
+            }
+            // An abort used to stop a phase is neither a success nor a failed network sample.
+            token.ThrowIfCancellationRequested();
+            lock (reportGate)
+            {
+                Statistics(phase).Samples.Add(sample);
+                RefreshLatency(phase);
+            }
+            return error;
+        }
+
+        private void RefreshLatency(SpeedTestPhase phase)
+        {
+            var statistics = Statistics(phase);
+            var values = new List<double>();
+            statistics.FailureCount = 0;
+            foreach (var sample in statistics.Samples)
+                if (sample.State == LatencySampleState.Success && sample.Milliseconds.HasValue) values.Add(sample.Milliseconds.Value);
+                else statistics.FailureCount++;
+            statistics.SuccessCount = values.Count;
+            statistics.MedianMs = values.Count >= MinimumLatencySamples ? (double?)Median(values.ToArray()) : null;
+            statistics.P95Ms = values.Count >= MinimumLatencySamples ? (double?)Percentile95(values.ToArray()) : null;
+            result.LatencyMs = result.IdleLatency.MedianMs;
+            result.DownloadLatencyDeltaMs = Delta(result.DownloadLatency, result.IdleLatency);
+            result.UploadLatencyDeltaMs = Delta(result.UploadLatency, result.IdleLatency);
+        }
+
+        private static double? Delta(LatencyStatistics loaded, LatencyStatistics idle)
+        {
+            return loaded.MedianMs.HasValue && idle.MedianMs.HasValue ? loaded.MedianMs - idle.MedianMs : null;
+        }
+
+        private void FinishLatency(SpeedTestPhase phase, bool interrupted)
+        {
+            lock (reportGate)
+            {
+                RefreshLatency(phase);
+                var statistics = Statistics(phase);
+                statistics.Status = interrupted ? LatencyMeasurementStatus.Interrupted : statistics.SuccessCount >= MinimumLatencySamples ? LatencyMeasurementStatus.Ready : LatencyMeasurementStatus.InsufficientSamples;
+            }
         }
 
         private void AddTraffic(int count, bool upload)
@@ -261,9 +412,13 @@ namespace NetworkRescue
         }
         private void StartPhase(SpeedTestPhase phase, string text)
         {
+            lock (reportGate)
+            {
             result.Phase = phase; result.State = text; result.PhaseCompleted = false;
+            Statistics(phase).Status = LatencyMeasurementStatus.Sampling;
             result.PhaseAverageMbps = null; result.PhaseElapsedSeconds = 0;
             phaseConfirmedBytes = 0; phaseWatch = Stopwatch.StartNew(); Report(true);
+            }
         }
         private void Report(bool force)
         {
@@ -292,6 +447,12 @@ namespace NetworkRescue
             var sorted = (double[])samples.Clone(); Array.Sort(sorted);
             int middle = sorted.Length / 2;
             return sorted.Length % 2 == 0 ? (sorted[middle - 1] + sorted[middle]) / 2 : sorted[middle];
+        }
+        internal static double Percentile95(double[] samples)
+        {
+            if (samples == null || samples.Length == 0) throw new ArgumentException(I18n.T("至少需要一个延迟样本。"));
+            var sorted = (double[])samples.Clone(); Array.Sort(sorted);
+            return sorted[(int)Math.Ceiling(sorted.Length * 0.95) - 1];
         }
         private static string FriendlyError(Exception ex)
         {

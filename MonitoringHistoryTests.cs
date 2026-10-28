@@ -5,6 +5,7 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
+using System.Xml;
 using System.Xml.Serialization;
 
 namespace NetworkRescue
@@ -45,6 +46,87 @@ namespace NetworkRescue
         {
             using (MemoryStream stream = new MemoryStream()) { new XmlSerializer(typeof(MonitoringHistoryDocument)).Serialize(stream, new MonitoringHistoryDocument { Version = 1, Record = record }); return Encoding.UTF8.GetString(stream.ToArray()); }
         }
+        private static string RemoveXmlNodes(string xml, params string[] paths)
+        {
+            XmlDocument document = new XmlDocument { XmlResolver = null }; document.LoadXml(xml);
+            foreach (string path in paths) foreach (XmlNode node in document.SelectNodes(path)) node.ParentNode.RemoveChild(node);
+            return document.OuterXml;
+        }
+        private static WifiStabilitySample Wifi(DateTime time)
+        {
+            return new WifiStabilitySample { TimeUtc = time, StateCode = "Available", Interfaces = new[] { new WifiLinkSample { InterfaceId = "11111111-2222-3333-4444-555555555555", State = 1, Readability = "Available", SignalPercent = 67, RxKbps = 144000, TxKbps = 72000 } } };
+        }
+        private static MonitoringHistoryRecord WifiRecord()
+        {
+            MonitoringHistoryRecord record = Record(2, 1, "Completed"); record.WifiCollectionEnabled = true; record.WifiTotalSamples = 1; record.WifiSamples = new[] { Wifi(Now.AddSeconds(1)) }; return record;
+        }
+        private static void LegacyWifiCompatibility(string root)
+        {
+            Directory.CreateDirectory(root); MonitoringHistoryStore store = new MonitoringHistoryStore(root);
+            MonitoringHistoryRecord old = Record(2, 1, "Completed"); string path = PathFor(root, old.Id);
+            string xml = RemoveXmlNodes(Xml(old), "/MonitoringHistoryDocument/Record/WifiCollectionEnabled", "/MonitoringHistoryDocument/Record/WifiTotalSamples", "/MonitoringHistoryDocument/Record/WifiSamples");
+            Assert(xml.Contains("<Version>1</Version>") && !xml.Contains("Wifi"), "legacy fixture is genuine schema one without any new Wifi nodes");
+            Encrypt(path, xml); byte[] before = File.ReadAllBytes(path);
+            MonitoringHistoryRecord loaded = store.Load(old.Id); MonitoringHistoryInfo info = store.List().Single();
+            Assert(!loaded.WifiCollectionEnabled && loaded.WifiTotalSamples == 0 && loaded.WifiSamples != null && loaded.WifiSamples.Length == 0 && !loaded.WifiTruncated, "schema one defaults to Wifi collection disabled with no invented evidence");
+            Assert(!info.WifiCollectionEnabled && info.WifiSampleCount == 0 && info.WifiTotalSamples == 0 && !info.WifiTruncated && info.ErrorCode == null, "legacy list exposes explicit zero Wifi metadata");
+            Assert(loaded.Samples.Length == 2 && loaded.Samples[0].Sequence == 1 && !loaded.Samples[0].Success && loaded.Samples[1].Sequence == 2 && loaded.Samples[1].Success, "schema one retains original outage and recovery samples");
+            Assert(before.SequenceEqual(File.ReadAllBytes(path)) && Decrypt(path) == xml, "loading and listing schema one never migrates or rewrites disk bytes");
+            old = WifiRecord(); Encrypt(PathFor(root, old.Id), Xml(old)); Reject(delegate { store.Load(old.Id); }, "schema one cannot smuggle schema two Wifi evidence");
+        }
+        private static void WifiHistoryRoundTrip(string root)
+        {
+            MonitoringHistoryStore store = new MonitoringHistoryStore(root); MonitoringHistoryRecord record = WifiRecord();
+            MonitoringHistoryRecord saved = store.Save(record); string path = PathFor(root, record.Id);
+            Assert(Decrypt(path).Contains("<Version>2</Version>") && Decrypt(path).Contains("<WifiTotalSamples>1</WifiTotalSamples>"), "new Wifi history writes schema two using existing DPAPI entropy");
+            record.WifiSamples[0].Interfaces[0].SignalPercent = 1; saved.WifiSamples[0].Interfaces[0].RxKbps = 1;
+            MonitoringHistoryRecord loaded = new MonitoringHistoryStore(root).Load(record.Id); MonitoringHistoryInfo info = store.List().Single();
+            Assert(loaded.WifiCollectionEnabled && loaded.WifiTotalSamples == 1 && loaded.WifiSamples.Length == 1 && loaded.WifiSamples[0].Interfaces[0].SignalPercent == 67 && loaded.WifiSamples[0].Interfaces[0].RxKbps == 144000, "Wifi save input and returned graphs are detached from disk");
+            loaded.WifiSamples[0].Interfaces[0].TxKbps = 1;
+            Assert(store.Load(record.Id).WifiSamples[0].Interfaces[0].TxKbps == 72000, "Wifi loaded graph mutations never modify the saved record");
+            Assert(info.WifiCollectionEnabled && info.WifiSampleCount == 1 && info.WifiTotalSamples == 1 && !info.WifiTruncated, "Wifi metadata includes collection status and retained and total counts");
+            record = WifiRecord(); record.EndedUtc = Now.AddSeconds(1000); record.WifiTotalSamples = 721;
+            record.WifiSamples = Enumerable.Range(1, 720).Select(delegate(int index) { return Wifi(Now.AddSeconds(index)); }).ToArray(); store.Save(record);
+            loaded = store.Load(record.Id); info = store.List().Single(delegate(MonitoringHistoryInfo item) { return item.Id == record.Id; });
+            Assert(loaded.WifiSamples.Length == 720 && loaded.WifiTotalSamples == 721 && loaded.WifiTruncated && info.WifiSampleCount == 720 && info.WifiTotalSamples == 721 && info.WifiTruncated, "Wifi rolling window preserves total count and explicitly reports truncation above 720");
+            record = WifiRecord(); record.WifiTotalSamples = 3;
+            record.WifiSamples = new[] {
+                new WifiStabilitySample { TimeUtc = Now, StateCode = "Unavailable", ErrorCode = "NativeError", NativeErrorCode = 5, Interfaces = new[] { new WifiLinkSample { InterfaceId = "11111111-2222-3333-4444-555555555555", State = 1, Readability = "Unavailable", QueryError = 5 } } },
+                new WifiStabilitySample { TimeUtc = Now.AddSeconds(1), StateCode = "Unavailable", ErrorCode = "AccessDenied" },
+                new WifiStabilitySample { TimeUtc = Now.AddSeconds(2), StateCode = "NotConnected", Interfaces = new[] { new WifiLinkSample { InterfaceId = "11111111-2222-3333-4444-555555555555", State = 4, Readability = "NotConnected" } } }
+            }; store.Save(record); loaded = store.Load(record.Id);
+            Assert(loaded.WifiSamples[0].StateCode == "Unavailable" && loaded.WifiSamples[0].ErrorCode == "NativeError" && loaded.WifiSamples[0].NativeErrorCode == 5 && loaded.WifiSamples[0].Interfaces[0].QueryError == 5 && !loaded.WifiSamples[0].Interfaces[0].SignalPercent.HasValue, "native WLAN errors persist as unavailable observations with native evidence");
+            Assert(loaded.WifiSamples[1].StateCode == "Unavailable" && loaded.WifiSamples[1].ErrorCode == "AccessDenied" && loaded.WifiSamples[2].StateCode == "NotConnected", "permission denial remains distinct from observed disconnected state");
+        }
+        private static void WifiHistoryValidation(string root)
+        {
+            MonitoringHistoryStore store = new MonitoringHistoryStore(root); MonitoringHistoryRecord record = WifiRecord();
+            record.WifiCollectionEnabled = false; Reject(delegate { store.Save(record); }, "disabled collection cannot contain Wifi evidence");
+            record = WifiRecord(); record.WifiTotalSamples = 0; Reject(delegate { store.Save(record); }, "retained Wifi samples require matching total count");
+            record = WifiRecord(); record.WifiTotalSamples = -1; Reject(delegate { store.Save(record); }, "negative Wifi total count rejected");
+            record = WifiRecord(); record.WifiTotalSamples = 2; Reject(delegate { store.Save(record); }, "unexplained Wifi sample loss below rolling limit rejected");
+            record = WifiRecord(); record.WifiTotalSamples = 721; record.WifiSamples = Enumerable.Range(0, 721).Select(delegate(int index) { return Wifi(Now.AddSeconds(1)); }).ToArray(); Reject(delegate { store.Save(record); }, "more than 720 retained Wifi snapshots rejected without silent trimming");
+            record = WifiRecord(); record.WifiSamples[0].Interfaces = Enumerable.Range(0, 9).Select(delegate(int index) { WifiLinkSample link = Wifi(Now).Interfaces[0]; link.InterfaceId = Guid.NewGuid().ToString("D"); return link; }).ToArray(); Reject(delegate { store.Save(record); }, "more than eight Wifi interfaces rejected");
+            record = WifiRecord(); record.WifiSamples[0].Interfaces = new[] { record.WifiSamples[0].Interfaces[0], record.WifiSamples[0].Interfaces[0] }; Reject(delegate { store.Save(record); }, "duplicate Wifi interface ids rejected");
+            record = WifiRecord(); record.WifiSamples[0].TimeUtc = Now.AddTicks(-1); Reject(delegate { store.Save(record); }, "Wifi sample before session start rejected");
+            record = WifiRecord(); record.WifiSamples[0].TimeUtc = record.EndedUtc.AddTicks(1); Reject(delegate { store.Save(record); }, "Wifi sample after session end rejected");
+            record = WifiRecord(); record.WifiSamples[0].TimeUtc = DateTime.SpecifyKind(Now, DateTimeKind.Unspecified); Reject(delegate { store.Save(record); }, "Wifi timestamp must explicitly be UTC");
+            record = WifiRecord(); record.WifiTotalSamples = 2; record.WifiSamples = new[] { Wifi(Now.AddSeconds(2)), Wifi(Now.AddSeconds(1)) }; Reject(delegate { store.Save(record); }, "out of order Wifi snapshots rejected");
+            record = WifiRecord(); record.WifiSamples[0].Interfaces[0].SignalPercent = 101; Reject(delegate { store.Save(record); }, "Wifi signal outside percentage range rejected");
+            record = WifiRecord(); record.WifiSamples[0].Interfaces[0].SignalPercent = null; Reject(delegate { store.Save(record); }, "available Wifi observation requires signal metric");
+            record = WifiRecord(); record.WifiSamples[0].Interfaces[0].State = 8; Reject(delegate { store.Save(record); }, "unknown WLAN interface state rejected");
+            record = WifiRecord(); record.WifiSamples[0].StateCode = "NotConnected"; Reject(delegate { store.Save(record); }, "available interface cannot be mislabeled disconnected");
+            record = WifiRecord(); record.WifiSamples[0].NativeErrorCode = 5; Reject(delegate { store.Save(record); }, "native Wifi error number requires NativeError code");
+            record = WifiRecord(); record.WifiSamples[0] = new WifiStabilitySample { TimeUtc = Now, StateCode = "Unavailable", ErrorCode = "NativeError" }; Reject(delegate { store.Save(record); }, "NativeError requires native error number");
+            Assert(!Directory.Exists(root), "invalid Wifi inputs never create persistent history");
+            record = WifiRecord(); store.Save(record); string path = PathFor(root, record.Id), valid = Decrypt(path);
+            Encrypt(path, RemoveXmlNodes(valid, "/MonitoringHistoryDocument/Record/WifiTotalSamples")); Reject(delegate { store.Load(record.Id); }, "schema two with Wifi evidence and missing total count rejected");
+            Encrypt(path, RemoveXmlNodes(valid, "/MonitoringHistoryDocument/Record/WifiCollectionEnabled")); Reject(delegate { store.Load(record.Id); }, "schema two with Wifi evidence and missing collection flag rejected");
+            Encrypt(path, valid.Replace("</WifiLinkSample>", "<SSID>private-network-name</SSID></WifiLinkSample>")); byte[] injected = File.ReadAllBytes(path);
+            Reject(delegate { store.Load(record.Id); }, "SSID injected as unknown Wifi XML node rejected");
+            Reject(delegate { store.Save(record); }, "invalid Wifi XML cannot be silently replaced by save");
+            Assert(injected.SequenceEqual(File.ReadAllBytes(path)) && store.List().Single().ErrorCode != null, "invalid Wifi XML remains intact and visibly unreadable");
+        }
         private static void RoundTrip(string root)
         {
             MonitoringHistoryStore store = new MonitoringHistoryStore(root);
@@ -58,7 +140,7 @@ namespace NetworkRescue
             MonitoringHistoryInfo info = store.List().Single();
             Assert(info.Id == record.Id && info.State == "Completed" && info.TargetCount == 2 && info.SampleCount == 10 && info.EventCount == 1 && info.TotalEvents == 1, "list metadata reflects archived samples");
             string path = PathFor(root, record.Id), plain = Decrypt(path);
-            Assert(plain.Contains("<Version>1</Version>") && plain.Contains("example1.test") && !plain.Contains("Fingerprint"), "schema one has no raw configuration fingerprints");
+            Assert(plain.Contains("<Version>2</Version>") && plain.Contains("example1.test") && !plain.Contains("Fingerprint"), "schema two has no raw configuration fingerprints");
             Assert(!Encoding.UTF8.GetString(File.ReadAllBytes(path)).Contains("example1.test"), "disk bytes contain ciphertext only");
             loaded.Samples[0].Status = "local-mutation";
             Assert(store.Load(record.Id).Samples[0].Status == "TimedOut", "load does not share mutable samples");
@@ -109,7 +191,7 @@ namespace NetworkRescue
             Reject(delegate { store.Load(bad.Id); }, "damaged record read rejected"); Reject(delegate { store.Save(bad); }, "damaged record cannot be silently replaced"); Reject(delegate { store.Delete(bad.Id); }, "damaged record cannot be deleted as verified history");
             Assert(damaged.SequenceEqual(File.ReadAllBytes(badPath)), "damaged bytes remain intact");
             Assert(store.Clear() == 1 && File.Exists(badPath) && store.List().Single().ErrorCode != null, "clear preserves damaged records and keeps them visible");
-            Encrypt(badPath, Xml(bad).Replace("<Version>1</Version>", "<Version>2</Version>")); Reject(delegate { store.Load(bad.Id); }, "unknown schema rejected");
+            Encrypt(badPath, Xml(bad).Replace("<Version>1</Version>", "<Version>3</Version>")); Reject(delegate { store.Load(bad.Id); }, "unknown schema rejected");
             Encrypt(badPath, Xml(bad).Replace("<Version>1</Version>", "")); Reject(delegate { store.Load(bad.Id); }, "missing schema rejected");
             Encrypt(badPath, Xml(bad).Replace("</Record>", "<RawFingerprint>secret</RawFingerprint></Record>")); Reject(delegate { store.Load(bad.Id); }, "unknown serialized fields rejected");
             Encrypt(badPath, Xml(bad).Replace(bad.Id, Guid.NewGuid().ToString("N"))); Reject(delegate { store.Load(bad.Id); }, "filename and record identity must match");
@@ -171,13 +253,14 @@ namespace NetworkRescue
             }
             else Console.WriteLine("File symlink test unavailable without Windows developer mode or symlink privilege; directory junction checks passed.");
         }
-        public static int Main()
+        public static int Main(string[] args)
         {
             string parent = Path.GetFullPath(Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location));
             string temporary = Path.Combine(parent, "monitor-history-checks-" + Guid.NewGuid().ToString("N"));
             try
             {
-                RoundTrip(Path.Combine(temporary, "roundtrip")); Validation(Path.Combine(temporary, "validation")); Corruption(Path.Combine(temporary, "corrupt")); Retention(Path.Combine(temporary, "retention")); FullArchive(Path.Combine(temporary, "full")); Reparse(Path.Combine(temporary, "reparse"));
+                LegacyWifiCompatibility(Path.Combine(temporary, "legacy-wifi")); WifiHistoryRoundTrip(Path.Combine(temporary, "wifi-roundtrip")); WifiHistoryValidation(Path.Combine(temporary, "wifi-validation"));
+                if (!args.Contains("--wifi-only")) { RoundTrip(Path.Combine(temporary, "roundtrip")); Validation(Path.Combine(temporary, "validation")); Corruption(Path.Combine(temporary, "corrupt")); Retention(Path.Combine(temporary, "retention")); FullArchive(Path.Combine(temporary, "full")); Reparse(Path.Combine(temporary, "reparse")); }
                 Console.WriteLine("Monitoring history checks passed: " + checks + " (DPAPI fixtures only; no network operations)"); return 0;
             }
             catch (Exception ex) { Console.Error.WriteLine("After " + checks + " checks: " + ex); return 1; }

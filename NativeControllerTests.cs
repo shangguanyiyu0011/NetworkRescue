@@ -33,6 +33,7 @@ namespace NetworkRescue
                 MonitoringRetentionChecks();
                 MonitoringHistoryBridgeChecks();
                 MonitoringPersistenceFailureChecks();
+                WifiMonitoringBridgeChecks();
                 MonitoringCaptureCancellationChecks();
                 SiteCommandChecks();
                 UpdateCommandChecks();
@@ -42,6 +43,7 @@ namespace NetworkRescue
                 HealthComparisonBudgetChecks();
                 ThemeCommandChecks();
                 SerializationBoundaryChecks();
+                MonitoringCombinedMessageBudgetChecks();
                 CancelLifecycleChecks();
                 NativeController noviceExport = UninitializedController();
                 typeof(NativeController).GetField("mode", BindingFlags.Instance | BindingFlags.NonPublic).SetValue(noviceExport, "beginner");
@@ -268,7 +270,7 @@ namespace NetworkRescue
             Check(typeof(NativeController).GetField("operation", flags).GetValue(controller) == null && !Directory.Exists(guardedRoot), "Automatic save retains the complete configuration gate");
             ((Task)typeof(NativeController).GetMethod("Dispatch", flags).Invoke(controller, new object[] { new Dictionary<string, object> { { "command", "saveHealthProfile" }, { "autoName", false }, { "name", "Manual fixture" } } })).GetAwaiter().GetResult();
             Check(typeof(NativeController).GetField("operation", flags).GetValue(controller) == null && !Directory.Exists(guardedRoot), "Explicit false with a valid manual name follows the original healthy report gate");
-            Check(NativeController.DisplayVersion == "1.1.0", "Controller display version matches 1.1.0");
+            Check(NativeController.DisplayVersion == "1.2.0", "Controller display version matches 1.2.0");
         }
 
         private static void HealthComparisonBudgetChecks()
@@ -458,6 +460,52 @@ namespace NetworkRescue
             finally { File.Delete(blocked); Directory.Delete(directory); }
         }
 
+        private static void WifiMonitoringBridgeChecks()
+        {
+            var target = new MonitorTarget { Id = "wifi-target", Host = "example.test", Method = "icmp" };
+            var session = new NativeController.MonitoringSession(new[] { target }) { StartedUtc = DateTime.UtcNow.AddMinutes(-20), EndedUtc = DateTime.UtcNow };
+            string interfaceId = Guid.NewGuid().ToString("D");
+            for (int i = 0; i < 725; i++)
+            {
+                session.WifiSamples.Enqueue(new WifiStabilitySample { TimeUtc = session.StartedUtc.AddSeconds(i), StateCode = "Available",
+                    Interfaces = new[] { new WifiLinkSample { InterfaceId = interfaceId, State = 1, Readability = "Available", SignalPercent = i % 101, RxKbps = 54000, TxKbps = 36000 } } });
+                if (session.WifiSamples.Count > 720) session.WifiSamples.Dequeue();
+                session.WifiTotalSamples++;
+            }
+            session.Changes.ObserveSample(new MonitorSample { TargetId = target.Id, TargetHost = target.Host, Method = "ICMP", TimeUtc = session.StartedUtc.AddSeconds(100), Success = false });
+            MonitoringHistoryRecord record = NativeController.CaptureMonitoringRecord(session, "Completed");
+            Check(record.WifiCollectionEnabled && record.WifiSamples.Length == 720 && record.WifiTotalSamples == 725 && record.WifiTruncated, "Monitoring records retain recent Wi-Fi evidence with an explicit complete observation count");
+            WifiStabilityReader.Validate(record.WifiSamples);
+            session.WifiSamples.Peek().Interfaces[0].SignalPercent = 100;
+            Check(record.WifiSamples[0].Interfaces[0].SignalPercent == 5, "Checkpoint freezes Wi-Fi evidence instead of sharing mutable live fields");
+            var serializer = new System.Web.Script.Serialization.JavaScriptSerializer();
+            var replay = serializer.Deserialize<Dictionary<string, object>>(serializer.Serialize(NativeController.BuildMonitoringReplay(record, 1)));
+            object[] wifi = ((System.Collections.IEnumerable)replay["wifiSamples"]).Cast<object>().ToArray();
+            Check(wifi.Length == 21 && (bool)replay["wifiSupported"] && (bool)replay["wifiTruncated"], "Replay returns only actual Wi-Fi observations within ten seconds of the selected event");
+            string exported = NativeController.BuildMonitoringRecordText(record, delegate(string key) { return key; });
+            Check(exported.Contains("wifiStabilityTitle") && exported.Contains("wifiTruncated") && exported.Contains("54.0 Mbps") && !exported.Contains(interfaceId), "Export includes real Wi-Fi rates and truncation without exposing stable adapter identities");
+            using (var release = new ManualResetEventSlim(false))
+            using (var started = new ManualResetEventSlim(false))
+            using (var finished = new ManualResetEventSlim(false))
+            using (var cancel = new CancellationTokenSource())
+            {
+                int readers = 0;
+                Task watch = NativeController.ObserveWifiAsync(session, null, cancel.Token, delegate
+                {
+                    Interlocked.Increment(ref readers); started.Set(); release.Wait(); finished.Set();
+                    return new WifiStabilitySample { TimeUtc = DateTime.UtcNow, StateCode = "NoWirelessInterface" };
+                });
+                try
+                {
+                    Check(started.Wait(1500), "Wi-Fi observer starts reads off the controller thread");
+                    var clock = System.Diagnostics.Stopwatch.StartNew(); cancel.Cancel(); bool stopped = false;
+                    try { watch.GetAwaiter().GetResult(); } catch (OperationCanceledException) { stopped = true; }
+                    Check(stopped && clock.ElapsedMilliseconds < 1000 && readers == 1, "Stopping monitoring does not wait for or multiply a stalled Wi-Fi native read");
+                }
+                finally { release.Set(); Check(finished.Wait(1500), "Fixture releases its stalled Wi-Fi reader"); }
+            }
+        }
+
         private static void MonitoringCaptureCancellationChecks()
         {
             var session = new NativeController.MonitoringSession(new[] { new MonitorTarget { Id = "a", Host = "127.0.0.1", Method = "icmp" } });
@@ -625,6 +673,31 @@ namespace NetworkRescue
             try { serializer.Serialize(new string('x', NativeController.MaximumUiJsonLength - 1)); } catch (InvalidOperationException) { rejected = true; }
             Check(rejected, "Oversized UI messages still have a hard limit");
         }
+        private static void MonitoringCombinedMessageBudgetChecks()
+        {
+            DateTime start = DateTime.UtcNow.AddMinutes(-20);
+            string domain = new string('a', 63) + "." + new string('b', 63) + "." + new string('c', 63) + "." + new string('d', 61);
+            MonitorTarget[] targets = Enumerable.Range(1, 4).Select(delegate(int i) { return new MonitorTarget { Id = new string('t', 31) + i, Host = domain, Method = "icmp" }; }).ToArray();
+            MonitoringHistoryRecord record = new MonitoringHistoryRecord { Id = Guid.NewGuid().ToString("N"), State = "Completed", StartedUtc = start, EndedUtc = DateTime.UtcNow,
+                IntervalMs = 1000, RequestedCount = 300, Targets = targets, TotalEvents = 500, WifiCollectionEnabled = true, WifiTotalSamples = 720 };
+            record.Samples = targets.SelectMany(delegate(MonitorTarget target) { return Enumerable.Range(1, 300).Select(delegate(int i) { return new MonitorSample {
+                TargetId = target.Id, TargetHost = target.Host, Method = "ICMP", Route = "Network", Sequence = i, Sent = i, Received = i, Success = true,
+                TimeUtc = start.AddSeconds(i), RttMs = 86400000, Min = 86400000, Avg = 86400000, Max = 86400000, JitterMs = 86400000,
+                Status = new string('S', 96), ErrorCode = new string('E', 96), ResolvedAddress = "2001:ffff:ffff:ffff:ffff:ffff:ffff:c000" }; }); }).ToArray();
+            string before = String.Join(", ", Enumerable.Range(0, 50).Select(delegate(int i) { return "2001:ffff:ffff:ffff:ffff:ffff:ffff:" + (0xc000 + i).ToString("x4"); }));
+            string after = String.Join(", ", Enumerable.Range(0, 50).Select(delegate(int i) { return "2001:ffff:ffff:ffff:ffff:ffff:ffff:" + (0xd000 + i).ToString("x4"); }));
+            record.Events = Enumerable.Range(1, 500).Select(delegate(int i) { return new NetworkChangeEvent { Sequence = i, TimeUtc = start.AddSeconds(i), Kind = "SettingChanged", Setting = "Dns",
+                TargetId = Guid.NewGuid().ToString("D"), AdapterName = new string((char)39, 256), Before = before, After = after }; }).ToArray();
+            record.WifiSamples = Enumerable.Range(0, 720).Select(delegate(int i) { return new WifiStabilitySample { TimeUtc = start.AddSeconds(i), StateCode = "Available",
+                Interfaces = Enumerable.Range(0, 8).Select(delegate(int j) { return new WifiLinkSample { InterfaceId = Guid.NewGuid().ToString("D"), State = 1, Readability = "Available", SignalPercent = 100, RxKbps = 5400000, TxKbps = 5400000 }; }).ToArray() }; }).ToArray();
+            typeof(MonitoringHistoryStore).GetMethod("Validate", BindingFlags.NonPublic | BindingFlags.Static).Invoke(null, new object[] { record, false });
+            var serializer = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = NativeController.MaximumUiJsonLength, RecursionLimit = 32 };
+            string packet = serializer.Serialize(new { type = "monitorHistoryLoaded", targets = record.Targets, events = record.Events, wifiSamples = record.WifiSamples,
+                series = targets.Select(delegate(MonitorTarget target) { return new { TargetId = target.Id, samples = record.Samples.Where(delegate(MonitorSample sample) { return sample.TargetId == target.Id; }).ToArray() }; }).ToArray() });
+            Check(packet.Length > 4 * 1024 * 1024 && packet.Length < NativeController.MaximumUiJsonLength && serializer.DeserializeObject(packet) != null,
+                "Legal maximum combined monitoring evidence with JSON-escaped adapter names fits the bounded shared UI envelope without truncation");
+        }
+
         private static void CancelLifecycleChecks()
         {
             BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;

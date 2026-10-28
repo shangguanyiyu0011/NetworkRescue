@@ -2,16 +2,16 @@
 
 Windows 本地网络诊断与针对性修复工具。先扫描、查看证据，再选择有明确前提的修复。
 
-**开发与维护：上官一羽** · **版本：1.1.0** · **GPL-3.0-only**
+**开发与维护：上官一羽** · **版本：1.2.0** · **GPL-3.0-only**
 
-[English](README.en.md) · [下载 1.1.0](https://github.com/shangguanyiyu0011/NetworkRescue/releases/tag/v1.1.0) · [使用说明](docs/USAGE.zh-CN.txt) · [参与开发](CONTRIBUTING.md) · [验证记录](docs/RELEASE-READINESS.v1.1.md)
+[English](README.en.md) · [下载 1.2.0](https://github.com/shangguanyiyu0011/NetworkRescue/releases/tag/v1.2.0) · [使用说明](docs/USAGE.zh-CN.txt) · [参与开发](CONTRIBUTING.md) · [验证记录](docs/RELEASE-READINESS.v1.2.md)
 
 ## 下载与运行
 
 | 系统 | 便携包 |
 | --- | --- |
-| Windows 10/11 x64 | [NetworkRescue-v1.1.0-win-x64.zip](https://github.com/shangguanyiyu0011/NetworkRescue/releases/download/v1.1.0/NetworkRescue-v1.1.0-win-x64.zip) |
-| Windows 10 x86 | [NetworkRescue-v1.1.0-win-x86.zip](https://github.com/shangguanyiyu0011/NetworkRescue/releases/download/v1.1.0/NetworkRescue-v1.1.0-win-x86.zip) |
+| Windows 10/11 x64 | [NetworkRescue-v1.2.0-win-x64.zip](https://github.com/shangguanyiyu0011/NetworkRescue/releases/download/v1.2.0/NetworkRescue-v1.2.0-win-x64.zip) |
+| Windows 10 x86 | [NetworkRescue-v1.2.0-win-x86.zip](https://github.com/shangguanyiyu0011/NetworkRescue/releases/download/v1.2.0/NetworkRescue-v1.2.0-win-x86.zip) |
 
 支持基线为 Windows 10 22H2 / Windows 11、系统 .NET Framework 4.8 或更高版本。Windows 11 没有 x86 版；纯 32 位 Windows 尚未实测。
 
@@ -28,6 +28,9 @@ Windows 本地网络诊断与针对性修复工具。先扫描、查看证据，
 - **健康快照与常用设置**：保存最多 20 个健康快照和 20 个完整监测方案。正常诊断卡可直接自动命名保存；设置内可手动命名。选择常用设置只填入参数，不自动监测。
 - **报告与备份**：导出先预览脱敏结果，再选择本地保存，不自动上传；修复前备份，支持受校验的本地还原及前后对比。
 - **宽带测速**：Cloudflare 节点单连接下载/上传、HTTP 往返与真实采样曲线；结果描述到该节点的路径。
+- **负载期间延迟**：测速分别记录空闲、下载和上传三个阶段的真实延迟样本，显示中位数、p95 与相对空闲阶段的增量。样本不足明确标注，不补成 0；仅反映到测试节点的路径，不能据此确认路由器导致延迟。
+- **Wi-Fi 稳定性时间线**：仅在手动监测期间，约每 5 秒只读采集 WLAN 当前连接的信号、链路速率及 UTC 时间，最多保留 720 个采集快照、每次最多 8 个接口，可与无应答事件联查。不存 SSID/BSSID/网卡名称，不更改 WLAN 权限、服务或信道。
+- **DNS 稳定性**：显式指定 1 个域名与 1–4 个 DNS 服务器，运行 3–10 轮（默认 5 轮），总时限 60 秒。分别显示响应率、解析结果及超时率；每轮延迟为 A+AAAA 查询的总耗时，不是单次查询 RTT。结果受缓存影响且只针对该域名，不自动改 DNS，也不凭单次最快结果推荐服务器。
 - **更新检查**：默认使用官方仓库 `shangguanyiyu0011/NetworkRescue`；旧空配置自动补全，非空自定义仓库保留。仍须点击检查并手动下载，不自动联网检查或安装。
 - **十语与两套外观**：简中、繁中、英语、日语、韩语、德语、法语、西语、葡语、俄语；暖昼/静夜即时切换。使用帮助与离线自救说明可在断网时阅读。
 
@@ -52,11 +55,11 @@ ICMP 不跟随 HTTP 代理，网关不回 Ping 不能证明断网；忽略系统
 
 健康快照要求最近 5 分钟内成功联网诊断，保存前配置仍相同且读取完整。只比较去秘密后的代理 authority、DNS/IP、已配置网关与网卡状态，变化不等于故障，不自动还原。跨启动不保存或比较 PAC 私密路径/凭据。
 
-设置、备份、历史及工作区保存在 `%LOCALAPPDATA%\NetworkRescue\`，与旧版本兼容。健康快照和方案使用当前用户 DPAPI 保护；加密不等于匿名化，分享报告仍须检查脱敏结果。监测记录使用当前用户 DPAPI 自动本地加密保存到 `Monitoring\`，不上传、不后台驻留。每 15 秒及结束/关闭时保存；意外中断的 `Interrupted` 只恢复最后检查点，最多 15 秒采样可能未保存。损坏记录不覆盖、不删除，“清空”只删除可读记录。加密记录可能含 IP/域名，不是匿名数据。TCP 进程关联不是原子实时快照，进程退出、权限和 PID 复用会限制结果；筛选只作用于最多 512 条已读取记录，不提权、不结束程序。
+设置、备份、历史及工作区保存在 `%LOCALAPPDATA%\NetworkRescue\`，与旧版本兼容。健康快照和方案使用当前用户 DPAPI 保护；加密不等于匿名化，分享报告仍须检查脱敏结果。监测记录使用当前用户 DPAPI 自动本地加密保存到 `Monitoring\`，不上传、不后台驻留。每 15 秒及结束/关闭时保存；意外中断的 `Interrupted` 只恢复最后检查点，最多 15 秒采样可能未保存。损坏记录不覆盖、不删除，“清空”只删除可读记录。监测历史写入 schema 2，继续读取 1.1 的 schema 1；旧记录缺少 Wi-Fi 观测不代表当时没有无线连接。加密记录可能含 IP/域名，不是匿名数据。应用仍不在托盘或后台常驻。TCP 进程关联不是原子实时快照，进程退出、权限和 PID 复用会限制结果；筛选只作用于最多 512 条已读取记录，不提权、不结束程序。
 
 ## 界面预览
 
-以下五图为 **1.0.0 首次上传时的真实 WPF 界面与合成演示数据**，是历史截图，未重新截图，不作为 1.1.0 实窗验证或真实公网诊断、测速结论。
+以下五图为 **1.0.0 首次上传时的真实 WPF 界面与合成演示数据**，是历史截图，未重新截图，不作为 1.2.0 实窗验证或真实公网诊断、测速结论。
 
 ![新手诊断 · 暖昼](docs/screenshots/diagnosis-beginner-light.png)
 
@@ -75,7 +78,7 @@ ICMP 不跟随 HTTP 代理，网关不回 Ping 不能证明断网；忽略系统
 
 ## 从源码构建
 
-使用同版本 [v1.1.0 源码](https://github.com/shangguanyiyu0011/NetworkRescue/tree/v1.1.0)，在已允许本地脚本的 PowerShell 中运行：
+使用同版本 [v1.2.0 源码](https://github.com/shangguanyiyu0011/NetworkRescue/tree/v1.2.0)，在已允许本地脚本的 PowerShell 中运行：
 
 ```powershell
 .\build.ps1 -Architecture x64
@@ -85,13 +88,13 @@ ICMP 不跟随 HTTP 代理，网关不回 Ping 不能证明断网；忽略系统
 .\publish.ps1 -Architecture x86 -SkipBuild
 ```
 
-构建使用系统 C# 编译器、C# 5 / .NET Framework 4.8 和 WPF 引用，不恢复 NuGet、不下载运行时。默认执行 18 套 C# 检查，输出 `build-native-x64` / `build-native-x86`；打包输出到 `dist`。直接运行 `publish.ps1 -Architecture x64` 或 `x86` 也会先完整构建检查，再打包。脚本不会上传或自动发布。
+构建使用系统 C# 编译器、C# 5 / .NET Framework 4.8 和 WPF 引用，不恢复 NuGet、不下载运行时。默认执行 20 套 C# 检查，输出 `build-native-x64` / `build-native-x86`；打包输出到 `dist`。直接运行 `publish.ps1 -Architecture x64` 或 `x86` 也会先完整构建检查，再打包。脚本不会上传或自动发布。
 
-1.1.0 产品版本为 1.1.0、程序集/文件版本为 1.1.0.0。新增监测持久化与跨启动回放、分地址族 HTTP(S) 验证及疑似门户手动入口；四种修复的范围不变。18 套检查的本版实际结果、双架构产物及验证边界统一见[1.1 验证记录](docs/RELEASE-READINESS.v1.1.md)。1.0.0 的 3318/3316 项等结果仅属于[历史验证记录](docs/RELEASE-READINESS.v1.md)，不转作 1.1.0 通过证据。
+1.2.0 产品版本为 1.2.0、程序集/文件版本为 1.2.0.0。新增负载期间延迟、Wi-Fi 稳定性时间线和 DNS 稳定性；1.1 的监测持久化、分地址族 HTTP(S) 与手动门户入口保留，四种修复范围不变。本版 20 套检查的双架构结果、产物及验证边界统一见[1.2 验证记录](docs/RELEASE-READINESS.v1.2.md)。[1.1 验证](docs/RELEASE-READINESS.v1.1.md)及[1.0 历史验证](docs/RELEASE-READINESS.v1.md)只证明各自产物，不转作 1.2.0 通过证据。
 
 ## 许可与反馈
 
-自有代码采用 **GPL-3.0-only**，见 [LICENSE](LICENSE)；对应源码与构建脚本位于同版本 [v1.1.0 标签](https://github.com/shangguanyiyu0011/NetworkRescue/tree/v1.1.0)。第三方及系统服务说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+自有代码采用 **GPL-3.0-only**，见 [LICENSE](LICENSE)；对应源码与构建脚本位于同版本 [v1.2.0 标签](https://github.com/shangguanyiyu0011/NetworkRescue/tree/v1.2.0)。第三方及系统服务说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 官方提供免费使用，不售激活码、不收使用授权费。GPL 允许在履行许可、对应源码等义务的前提下收费分发，收费本身不等于侵权或冒充官方，参见 [GNU GPL 常见问题](https://www.gnu.org/licenses/gpl-faq.en.html#DoesTheGPLAllowMoney)。如遇冒充官方售卖或收费激活，可向相关平台或 `shangguanyiyu0011@gmail.com` 反馈。软件“设置→反馈”仅复制邮箱，不发送邮件或自动附加报告。
 

@@ -82,7 +82,7 @@ namespace NetworkRescue
                     Assert(result.LatencyMs.HasValue && result.DownloadMbps > 0 && result.UploadMbps > 0, "all metrics measured");
                     Assert(result.DownloadBytes == 8192 && result.UploadBytes == 4096, "actual download/upload byte count");
                     Assert(server.Downloaded == 8192 && server.Uploaded == 4096, "server corroborates byte counts");
-                    Assert(server.LatencyRequests == 5, "five requests use bytes=0");
+                    Assert(server.LatencyRequests >= 5 && result.IdleLatency.Samples.Count == 5, "idle uses five bytes=0 requests with additional loaded probes");
                     Assert(result.TotalBytes == 12288 && result.TotalBytes <= SpeedTest.MaximumPayloadBytes, "small configured traffic caps enforced");
                     Assert(result.Node.Contains("LHR"), "node derived from Cf-Ray");
                     Assert(!server.SawAuthorization, "no default credentials transmitted");
@@ -90,6 +90,9 @@ namespace NetworkRescue
                     CompletedPhase(samples, SpeedTestPhase.Upload, result.UploadMbps, 4096);
                     Assert(result.Phase == SpeedTestPhase.Upload && result.PhaseCompleted && result.PhaseAverageMbps == result.UploadMbps, "terminal result retains upload endpoint");
                     var copied = result.Copy();
+                    copied.IdleLatency.Samples[0].Milliseconds = -1;
+                    copied.IdleLatency.Samples.Clear();
+                    Assert(result.IdleLatency.Samples.Count == 5 && result.IdleLatency.Samples[0].Milliseconds >= 0, "Copy deeply isolates latency collection and typed samples");
                     Assert(copied.Phase == result.Phase && copied.PhaseElapsedSeconds == result.PhaseElapsedSeconds && copied.PhaseAverageMbps == result.PhaseAverageMbps && copied.PhaseCompleted, "Copy retains additive phase fields");
                     var serializer = new System.Web.Script.Serialization.JavaScriptSerializer();
                     var json = (Dictionary<string, object>)serializer.DeserializeObject(serializer.Serialize(result));
@@ -136,6 +139,8 @@ namespace NetworkRescue
                     var samples = new Samples();
                     var result = new SpeedTest(server.Url, 1, 1, 1000, 4000).Run(false, samples, CancellationToken.None);
                     Assert(result.Completed, "single byte phases complete");
+                    Assert(result.DownloadLatency.Status == LatencyMeasurementStatus.InsufficientSamples && result.UploadLatency.Status == LatencyMeasurementStatus.InsufficientSamples, "fast stages explicitly report insufficient loaded samples");
+                    Assert(!result.DownloadLatency.MedianMs.HasValue && !result.DownloadLatency.P95Ms.HasValue && !result.DownloadLatencyDeltaMs.HasValue && !result.UploadLatencyDeltaMs.HasValue, "insufficient loaded samples never fabricate latency or zero delta");
                     Assert(CompletedPhase(samples, SpeedTestPhase.Download, result.DownloadMbps, 1).PhaseElapsedSeconds < 0.2, "fast download emits forced endpoint before report interval");
                     Assert(CompletedPhase(samples, SpeedTestPhase.Upload, result.UploadMbps, 1).PhaseElapsedSeconds < 0.2, "fast upload emits forced endpoint before report interval");
                 }
@@ -247,11 +252,188 @@ namespace NetworkRescue
                 rejected = false;
                 try { new SpeedTest(new Uri("http://127.0.0.1/"), 49 * SpeedTest.MiB, 1, 1, 1); } catch (ArgumentOutOfRangeException) { rejected = true; }
                 Assert(rejected, "configured download cannot exceed production cap");
+                Assert(SpeedTest.Percentile95(new double[] { 1, 2, 3, 4, 5 }) == 5, "p95 uses nearest rank of successful observations");
+                using (var server = new ConcurrentLatencyServer(1700, 90))
+                {
+                    var point = ServicePointManager.FindServicePoint(server.Url); int oldLimit = point.ConnectionLimit;
+                    point.ConnectionLimit = 1;
+                    try
+                    {
+                        var samples = new Samples();
+                        var result = new SpeedTest(server.Url, 4096, 4096, 2300, 6000).Run(false, samples, CancellationToken.None);
+                        Assert(result.Completed && result.DownloadMbps > 0 && result.UploadMbps > 0, "concurrent fixture preserves throughput under per-group connection limit one: " + result.Detail);
+                        Assert(result.IdleLatency.Status == LatencyMeasurementStatus.Ready && result.DownloadLatency.Status == LatencyMeasurementStatus.Ready && result.UploadLatency.Status == LatencyMeasurementStatus.Ready, "three phases have enough genuine latency observations");
+                        Assert(result.DownloadLatencyDeltaMs > 40 && result.UploadLatencyDeltaMs > 40, "real server load increases both phase medians relative to idle");
+                        Assert(result.DownloadLatency.P95Ms >= result.DownloadLatency.MedianMs && result.UploadLatency.P95Ms >= result.UploadLatency.MedianMs, "p95 and median use matching successful typed samples");
+                        Assert(result.DownloadLatency.FailureCount == 0 && result.UploadLatency.FailureCount == 0, "phase stop cancellation does not create failure");
+                        Assert(server.MaximumActive >= 2 && server.MaximumProbes == 1, "dedicated connection group overlaps transfer without queued parallel probes");
+                        Assert(result.TotalBytes == 8192 && server.Uploaded == 4096 && server.Downloaded == 4096, "loaded probes add no fictional payload bytes");
+                        CheckLatencySamples(result.DownloadLatency, SpeedTestPhase.Download);
+                        CheckLatencySamples(result.UploadLatency, SpeedTestPhase.Upload);
+                        int before = result.DownloadLatency.Samples.Count; Thread.Sleep(120);
+                        Assert(before == result.DownloadLatency.Samples.Count, "no probe mutates a returned frozen phase");
+                        var old = samples.Values[0];
+                        Assert(old.IdleLatency.Samples.Count == 0 && old.DownloadLatency.Samples.Count == 0, "progress snapshot remains isolated from worker mutation");
+                    }
+                    finally { point.ConnectionLimit = oldLimit; }
+                }
+                using (var server = new ConcurrentLatencyServer(2100, 1800))
+                {
+                    var result = new SpeedTest(server.Url, 4096, 4096, 2500, 6000).Run(false, null, CancellationToken.None);
+                    Assert(result.Completed && result.DownloadLatency.FailureCount >= 1 && result.UploadLatency.FailureCount >= 1, "bounded slow probes time out while throughput still completes");
+                    Assert(result.DownloadLatency.Status == LatencyMeasurementStatus.InsufficientSamples && !result.DownloadLatencyDeltaMs.HasValue, "failed probes are excluded from median and delta");
+                    foreach (var sample in result.DownloadLatency.Samples)
+                        if (sample.State == LatencySampleState.Failed) Assert(!sample.Milliseconds.HasValue && sample.FailureCode == "Timeout", "timeout remains a typed failed observation");
+                    Assert(server.MaximumProbes <= 2, "timeout does not queue multiple client probes (server may still finish an aborted request)");
+                }
+                using (var server = new ConcurrentLatencyServer(1500, 1000))
+                using (var cancel = new CancellationTokenSource())
+                {
+                    var task = Task.Run(delegate { return new SpeedTest(server.Url, 4096, 4096, 2000, 6000).Run(false, null, cancel.Token); });
+                    Assert(server.TransferStarted.WaitOne(1500), "loaded transfer begins before cancel");
+                    Thread.Sleep(100); var watch = Stopwatch.StartNew(); cancel.Cancel();
+                    Assert(task.Wait(1500) && watch.ElapsedMilliseconds < 1400, "cancel joins and actively aborts loaded probe promptly");
+                    Assert(task.Result.DownloadLatency.Status == LatencyMeasurementStatus.Interrupted && task.Result.DownloadLatency.FailureCount == 0, "external cancellation marks phase interrupted without false probe failures");
+                    Assert(!task.Result.DownloadLatencyDeltaMs.HasValue && !task.Result.UploadLatencyDeltaMs.HasValue, "cancelled insufficient probes have no fabricated delta");
+                }
+                using (var server = new ConcurrentLatencyServer(650, 5, true))
+                {
+                    var result = new SpeedTest(server.Url, 4096, 4096, 1000, 3000).Run(false, null, CancellationToken.None);
+                    int invalid = result.DownloadLatency.FailureCount + result.UploadLatency.FailureCount;
+                    Assert(result.Completed && invalid > 0, "nonempty probe response is rejected independently from successful throughput");
+                    Assert(result.DownloadBytes == 4096 + invalid && result.UploadBytes == 4096, "every consumed invalid zero-byte probe body byte enters actual traffic accounting");
+                    Assert(result.TotalBytes <= SpeedTest.MaximumPayloadBytes && result.DownloadBytes == server.Downloaded, "bounded invalid probe reads agree with server actual body traffic");
+                    Assert(!result.DownloadLatencyDeltaMs.HasValue && !result.UploadLatencyDeltaMs.HasValue, "invalid nonempty probes cannot create a latency delta");
+                }
+                Assert(48 * SpeedTest.MiB + 24 * SpeedTest.MiB + 100 * 4097 + 128 < SpeedTest.MaximumPayloadBytes, "transfer caps, bounded acknowledgement tails and at most 30-second scheduled probe bodies fit hard 73 MiB ceiling");
                 Assert(loopbackBytes < 2 * SpeedTest.MiB, "all loopback fixtures stay below 2 MiB actual body traffic");
                 Console.WriteLine("PASS: " + assertions + " speed-test assertions; loopback traffic only; body bytes=" + loopbackBytes + ".");
                 return 0;
             }
             catch (Exception ex) { Console.Error.WriteLine(ex.ToString()); return 1; }
+        }
+
+        private static void CheckLatencySamples(LatencyStatistics statistics, SpeedTestPhase phase)
+        {
+            var values = new List<double>(); int failures = 0; double previous = -1;
+            foreach (var sample in statistics.Samples)
+            {
+                Assert(sample.Phase == phase && sample.StartedUtc.Kind == DateTimeKind.Utc && sample.PhaseElapsedSeconds >= previous, "probe records immutable originating phase, UTC start and monotonic phase start time");
+                previous = sample.PhaseElapsedSeconds;
+                if (sample.State == LatencySampleState.Success) values.Add(sample.Milliseconds.Value); else failures++;
+            }
+            Assert(values.Count == statistics.SuccessCount && failures == statistics.FailureCount, "typed samples corroborate counts");
+            Assert(statistics.MedianMs == SpeedTest.Median(values.ToArray()) && statistics.P95Ms == SpeedTest.Percentile95(values.ToArray()), "statistics are computed from exactly the exported typed observations");
+        }
+
+        private sealed class ConcurrentLatencyServer : IDisposable
+        {
+            private readonly TcpListener listener;
+            private readonly Thread accept;
+            private readonly int transferDelay, probeDelay;
+            private readonly bool extraProbeBody;
+            private readonly List<Thread> workers = new List<Thread>();
+            private volatile bool disposed;
+            private int active, probes, transfers;
+            public int MaximumActive, MaximumProbes;
+            public long Downloaded, Uploaded;
+            public readonly ManualResetEvent TransferStarted = new ManualResetEvent(false);
+            public Uri Url;
+            public ConcurrentLatencyServer(int delay, int latency, bool malformedProbeBody = false)
+            {
+                transferDelay = delay; probeDelay = latency;
+                extraProbeBody = malformedProbeBody;
+                listener = new TcpListener(IPAddress.Loopback, 0); listener.Start();
+                Url = new Uri("http://127.0.0.1:" + ((IPEndPoint)listener.LocalEndpoint).Port + "/");
+                accept = new Thread(delegate()
+                {
+                    while (!disposed)
+                    {
+                        try
+                        {
+                            var client = listener.AcceptTcpClient();
+                            var worker = new Thread(delegate() { Handle(client); }); worker.IsBackground = true;
+                            lock (workers) workers.Add(worker); worker.Start();
+                        }
+                        catch (SocketException) { if (disposed) break; throw; }
+                    }
+                });
+                accept.IsBackground = true; accept.Start();
+            }
+            private void Handle(TcpClient client)
+            {
+                bool probe = false, transfer = false;
+                int current = Interlocked.Increment(ref active);
+                lock (workers) MaximumActive = Math.Max(MaximumActive, current);
+                try
+                {
+                    using (client)
+                    using (var stream = client.GetStream())
+                    {
+                        client.ReceiveTimeout = 3000; client.SendTimeout = 3000;
+                        var header = new StringBuilder();
+                        while (!header.ToString().EndsWith("\r\n\r\n", StringComparison.Ordinal))
+                        { int b = stream.ReadByte(); if (b < 0 || header.Length > 16000) return; header.Append((char)b); }
+                        string request = header.ToString(), path = request.Split(' ')[1];
+                        bool post = request.StartsWith("POST ", StringComparison.Ordinal); int count = 0;
+                        if (post)
+                        {
+                            foreach (string line in request.Split(new[] { "\r\n" }, StringSplitOptions.None))
+                                if (line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase)) count = Int32.Parse(line.Substring(15).Trim());
+                        }
+                        else count = Int32.Parse(path.Substring(path.IndexOf("bytes=", StringComparison.Ordinal) + 6).Split('&')[0]);
+                        probe = !post && count == 0; transfer = !probe;
+                        bool loadedProbe = probe && Interlocked.CompareExchange(ref transfers, 0, 0) > 0;
+                        if (probe)
+                        {
+                            int running = Interlocked.Increment(ref probes); lock (workers) MaximumProbes = Math.Max(MaximumProbes, running);
+                            if (!Delay(client, loadedProbe ? probeDelay : 5)) return;
+                        }
+                        else
+                        {
+                            Interlocked.Increment(ref transfers); TransferStarted.Set();
+                            if (post)
+                            {
+                                var bytes = new byte[1024];
+                                for (int n = 0; n < count; )
+                                { int read = stream.Read(bytes, 0, Math.Min(bytes.Length, count - n)); if (read <= 0) return; n += read; Interlocked.Add(ref Uploaded, read); Interlocked.Add(ref loopbackBytes, read); }
+                            }
+                            if (!Delay(client, transferDelay)) return;
+                        }
+                        int body = post ? 0 : count;
+                        bool invalidProbe = extraProbeBody && loadedProbe;
+                        if (invalidProbe) body = 1;
+                        byte[] response = Encoding.ASCII.GetBytes("HTTP/1.1 200 OK\r\n" + (invalidProbe ? "" : "Content-Length: " + body + "\r\n") + "Connection: close\r\n\r\n");
+                        stream.Write(response, 0, response.Length);
+                        if (body > 0) { byte[] bytes = new byte[body]; stream.Write(bytes, 0, body); Interlocked.Add(ref Downloaded, body); Interlocked.Add(ref loopbackBytes, body); }
+                    }
+                }
+                catch (IOException) { }
+                catch (SocketException) { }
+                finally
+                {
+                    if (probe) Interlocked.Decrement(ref probes);
+                    if (transfer) Interlocked.Decrement(ref transfers);
+                    Interlocked.Decrement(ref active);
+                }
+            }
+            private static bool Delay(TcpClient client, int milliseconds)
+            {
+                var watch = Stopwatch.StartNew();
+                while (watch.ElapsedMilliseconds < milliseconds)
+                {
+                    if (client.Client.Poll(0, SelectMode.SelectRead) && client.Client.Available == 0) return false;
+                    Thread.Sleep(Math.Min(10, Math.Max(1, milliseconds - (int)watch.ElapsedMilliseconds)));
+                }
+                return true;
+            }
+            public void Dispose()
+            {
+                disposed = true; listener.Stop(); accept.Join(2000);
+                Thread[] pending; lock (workers) pending = workers.ToArray();
+                foreach (var worker in pending) worker.Join(3500);
+                TransferStarted.Dispose();
+            }
         }
 
         private sealed class LocalServer : IDisposable

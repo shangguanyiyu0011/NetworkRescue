@@ -409,7 +409,7 @@ namespace NetworkRescue
             return new WifiEvidence { Id = adapter.Id, Name = adapter.Description, State = connection.State, AttributesRead = true, Ssid = Encoding.UTF8.GetString(connection.Association.Ssid.Bytes, 0, (int)connection.Association.Ssid.Length), Signal = connection.Association.Signal, RxKbps = connection.Association.RxRate, TxKbps = connection.Association.TxRate };
         }
 
-        private static WifiInsight ReadWifi()
+        internal static WifiInsight ReadWifi()
         {
             WifiInsight result = new WifiInsight();
             IntPtr client = IntPtr.Zero, list = IntPtr.Zero;

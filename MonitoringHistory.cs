@@ -21,6 +21,10 @@ namespace NetworkRescue
         public MonitorTarget[] Targets = new MonitorTarget[0];
         public MonitorSample[] Samples = new MonitorSample[0];
         public NetworkChangeEvent[] Events = new NetworkChangeEvent[0];
+        public bool WifiCollectionEnabled;
+        public int WifiTotalSamples;
+        public WifiStabilitySample[] WifiSamples = new WifiStabilitySample[0];
+        [XmlIgnore] public bool WifiTruncated { get { return WifiSamples != null && WifiTotalSamples > WifiSamples.Length; } }
         [XmlIgnore] public bool SamplesMissing { get { return Targets != null && Samples != null && Samples.Length < (long)Targets.Length * RequestedCount; } }
         [XmlIgnore] public bool EventsTruncated { get { return Events != null && TotalEvents > Events.Length; } }
     }
@@ -30,6 +34,9 @@ namespace NetworkRescue
         public string Id, State, ErrorCode;
         public DateTime StartedUtc, EndedUtc;
         public int IntervalMs, RequestedCount, TargetCount, SampleCount, EventCount, TotalEvents;
+        public bool WifiCollectionEnabled;
+        public int WifiSampleCount, WifiTotalSamples;
+        public bool WifiTruncated { get { return WifiTotalSamples > WifiSampleCount; } }
         public bool SamplesMissing { get { return SampleCount < (long)TargetCount * RequestedCount; } }
         public bool EventsTruncated { get { return TotalEvents > EventCount; } }
     }
@@ -142,6 +149,15 @@ namespace NetworkRescue
         {
             if (record == null || record.Id != CanonicalId(record.Id) || !new[] { "Running", "Completed", "Stopped", "Failed" }.Contains(record.State)) throw Invalid("InvalidMonitoringHistoryRecord");
             Time(record.StartedUtc); Time(record.EndedUtc);
+            if (record.WifiSamples == null || record.WifiTotalSamples < record.WifiSamples.Length || record.WifiSamples.Length != Math.Min(record.WifiTotalSamples, 720) || (!record.WifiCollectionEnabled && record.WifiTotalSamples != 0)) throw Invalid("InvalidMonitoringHistoryWifi");
+            WifiStabilityReader.Validate(record.WifiSamples);
+            DateTime previousWifi = record.StartedUtc;
+            foreach (WifiStabilitySample wifi in record.WifiSamples)
+            {
+                Time(wifi.TimeUtc);
+                if (wifi.TimeUtc < previousWifi || wifi.TimeUtc > record.EndedUtc) throw Invalid("InvalidMonitoringHistoryWifiTime");
+                previousWifi = wifi.TimeUtc;
+            }
             if (record.EndedUtc < record.StartedUtc || record.IntervalMs < 1000 || record.IntervalMs > 10000 || record.RequestedCount < 1 || record.RequestedCount > 3600 || record.Targets == null || record.Targets.Length < 1 || record.Targets.Length > 4 || record.Samples == null || record.Samples.Length > MaximumSamples || record.Samples.Length > record.Targets.Length * record.RequestedCount || record.Events == null || record.Events.Length > MaximumEvents || record.TotalEvents < record.Events.Length || record.Events.Length != Math.Min(record.TotalEvents, MaximumEvents)) throw Invalid("InvalidMonitoringHistoryRange");
             Dictionary<string, MonitorTarget> targets = new Dictionary<string, MonitorTarget>(StringComparer.Ordinal);
             foreach (MonitorTarget target in record.Targets)
@@ -191,7 +207,7 @@ namespace NetworkRescue
 
         private static byte[] Serialize(MonitoringHistoryRecord record)
         {
-            using (MemoryStream stream = new MemoryStream()) { Serializer().Serialize(stream, new MonitoringHistoryDocument { Version = 1, Record = record }); if (stream.Length > MaximumRecordBytes) throw Invalid("MonitoringHistoryRecordTooLarge"); return stream.ToArray(); }
+            using (MemoryStream stream = new MemoryStream()) { Serializer().Serialize(stream, new MonitoringHistoryDocument { Version = 2, Record = record }); if (stream.Length > MaximumRecordBytes) throw Invalid("MonitoringHistoryRecordTooLarge"); return stream.ToArray(); }
         }
         private static MonitoringHistoryRecord Deserialize(byte[] plain)
         {
@@ -200,7 +216,8 @@ namespace NetworkRescue
             using (XmlReader reader = XmlReader.Create(stream, new XmlReaderSettings { DtdProcessing = DtdProcessing.Prohibit, XmlResolver = null, MaxCharactersInDocument = MaximumRecordBytes }))
             {
                 MonitoringHistoryDocument document = (MonitoringHistoryDocument)Serializer().Deserialize(reader);
-                if (document == null || document.Version != 1) throw Invalid("MonitoringHistorySchema");
+                if (document == null || (document.Version != 1 && document.Version != 2)) throw Invalid("MonitoringHistorySchema");
+                if (document.Record != null && document.Version == 1 && (document.Record.WifiCollectionEnabled || document.Record.WifiTotalSamples != 0 || document.Record.WifiSamples == null || document.Record.WifiSamples.Length != 0)) throw Invalid("MonitoringHistorySchema");
                 return document.Record;
             }
         }
@@ -252,7 +269,7 @@ namespace NetworkRescue
                 return Scan().Select(delegate(Stored file)
                 {
                     MonitoringHistoryRecord r = file.Record;
-                    return r == null ? new MonitoringHistoryInfo { Id = file.Id, ErrorCode = file.Error } : new MonitoringHistoryInfo { Id = r.Id, StartedUtc = r.StartedUtc, EndedUtc = r.EndedUtc, State = DisplayState(r.State), IntervalMs = r.IntervalMs, RequestedCount = r.RequestedCount, TargetCount = r.Targets.Length, SampleCount = r.Samples.Length, EventCount = r.Events.Length, TotalEvents = r.TotalEvents };
+                    return r == null ? new MonitoringHistoryInfo { Id = file.Id, ErrorCode = file.Error } : new MonitoringHistoryInfo { Id = r.Id, StartedUtc = r.StartedUtc, EndedUtc = r.EndedUtc, State = DisplayState(r.State), IntervalMs = r.IntervalMs, RequestedCount = r.RequestedCount, TargetCount = r.Targets.Length, SampleCount = r.Samples.Length, EventCount = r.Events.Length, TotalEvents = r.TotalEvents, WifiCollectionEnabled = r.WifiCollectionEnabled, WifiSampleCount = r.WifiSamples.Length, WifiTotalSamples = r.WifiTotalSamples };
                 }).OrderByDescending(delegate(MonitoringHistoryInfo info) { return info.StartedUtc; }).ToArray();
             });
         }

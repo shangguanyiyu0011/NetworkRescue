@@ -24,7 +24,8 @@ namespace NetworkRescue
     public sealed class NativeWindow : Window
     {
         public event Action<string, Dictionary<string, object>> CommandRequested;
-        private readonly JavaScriptSerializer json = new JavaScriptSerializer { MaxJsonLength = 4 * 1024 * 1024, RecursionLimit = 64 };
+        private const int MaximumUiJsonLength = 8 * 1024 * 1024;
+        private readonly JavaScriptSerializer json = new JavaScriptSerializer { MaxJsonLength = MaximumUiJsonLength, RecursionLimit = 64 };
         private static readonly string[] Languages = { "zh-CN", "zh-TW", "en", "ja", "ko", "de", "fr", "es", "pt", "ru" };
         private static readonly string[] LanguageNames = { "简体中文", "繁體中文", "English", "日本語", "한국어", "Deutsch", "Français", "Español", "Português", "Русский" };
         private static readonly string[,] Checks = { { "Hardware", "hardware" }, { "Connection", "connection" }, { "DhcpService", "dhcp" }, { "Dns", "dns" }, { "Hosts", "hosts" }, { "Proxy", "browser" }, { "Winsock", "winsock" }, { "Http", "internet" } };
@@ -93,6 +94,11 @@ namespace NetworkRescue
         private bool monitorHistoryRequested;
         private Dictionary<string, object> portalLogin, historyReplay;
         private readonly Dictionary<string, List<Dictionary<string, object>>> historyReplaySamples = new Dictionary<string, List<Dictionary<string, object>>>();
+        private readonly List<Dictionary<string, object>> wifiSamples = new List<Dictionary<string, object>>();
+        private int wifiTotalSamples; private bool wifiTruncated, wifiSupported = true;
+        private StackPanel wifiPanel;
+        private Dictionary<string, object> dnsQuality;
+        private string dnsQualityRounds = "5"; private TextBox dnsQualityRoundsInput;
 
         public NativeWindow()
         {
@@ -118,7 +124,7 @@ namespace NetworkRescue
         public void Receive(string message)
         {
             if (!Dispatcher.CheckAccess()) { Dispatcher.BeginInvoke(new Action<string>(Receive), message); return; }
-            if (String.IsNullOrEmpty(message) || message.Length > 4 * 1024 * 1024) return;
+            if (String.IsNullOrEmpty(message) || message.Length > MaximumUiJsonLength) return;
             Dictionary<string, object> data;
             try { data = json.DeserializeObject(message) as Dictionary<string, object>; } catch (ArgumentException) { return; } catch (InvalidOperationException) { return; }
             if (data == null) return;
@@ -162,7 +168,7 @@ namespace NetworkRescue
                 case "monitorStarted": ApplyMonitorStarted(data); break;
                 case "monitorHistory":
                     SaveInputs(); monitorHistory = A(V(data, "entries")).Take(20).ToArray(); monitorHistoryError = S(data, "error");
-                    if (monitorHistoryError.Length == 0 && loadedMonitorHistory.Length > 0 && !monitorHistory.Select(D).Any(delegate(Dictionary<string, object> entry) { return S(entry, "Id") == loadedMonitorHistory; })) { ClearMonitorHistorySelection(); monitorSessionTargets.Clear(); monitorEvents.Clear(); monitorEventRows.Clear(); samples.Clear(); monitor = null; monitorEventTotal = 0; monitorEventTruncated = false; monitorFailed = false; }
+                    if (monitorHistoryError.Length == 0 && loadedMonitorHistory.Length > 0 && !monitorHistory.Select(D).Any(delegate(Dictionary<string, object> entry) { return S(entry, "Id") == loadedMonitorHistory; })) { ClearMonitorHistorySelection(); monitorSessionTargets.Clear(); monitorEvents.Clear(); monitorEventRows.Clear(); samples.Clear(); wifiSamples.Clear(); wifiTotalSamples = 0; wifiTruncated = false; wifiSupported = true; monitor = null; monitorEventTotal = 0; monitorEventTruncated = false; monitorFailed = false; }
                     if (!monitorHistory.Select(D).Any(delegate(Dictionary<string, object> entry) { return S(entry, "Id") == selectedMonitorHistory; })) selectedMonitorHistory = "";
                     if (page == "monitor") RenderPage(); break;
                 case "monitorHistoryLoaded": ApplyMonitorHistory(data); break;
@@ -175,6 +181,8 @@ namespace NetworkRescue
                     }
                     break;
                 case "monitorSample": RecordMonitorSample(D(V(data, "sample"))); break;
+                case "wifiSample":
+                    Dictionary<string, object> wifi = D(V(data, "sample")); if (wifi != null) { wifiSamples.Add(wifi); if (wifiSamples.Count > 720) wifiSamples.RemoveAt(0); wifiTotalSamples = Math.Max(wifiSamples.Count, (int)N(data, "totalSamples")); wifiTruncated = wifiTruncated || B(data, "truncated") || wifiTotalSamples > wifiSamples.Count; RenderWifiStability(); } break;
                 case "monitorResult": ApplyMonitorResult(D(V(data, "result"))); break;
                 case "networkChange": RecordMonitorEvent(D(V(data, "event"))); break;
                 case "monitorEnded":
@@ -182,6 +190,7 @@ namespace NetworkRescue
                     monitorFailed = B(data, "failed"); monitorEventTotal = Math.Max(monitorEventTotal, (int)N(data, "totalEvents")); monitorEventTruncated = monitorEventTruncated || B(data, "truncated");
                     if (busy == "monitor") { busy = null; cancelled = false; } if (page == "monitor") { RefreshMonitorCards(); UpdateMonitorEventCount(); RenderMonitorReplay(); } break;
                 case "dnsComparison": ReplaceResult(dnsResults, D(V(data, "result")), "Server"); if (page == "dnscompare") RenderDnsResults(); break;
+                case "dnsQuality": dnsQuality = D(V(data, "result")); if (page == "dnscompare") RenderDnsResults(); break;
                 case "siteProbe": ReplaceResult(siteProbes, D(V(data, "probe")), "Kind"); if (page == "site") RenderSiteResults(); break;
                 case "siteResult": site = D(V(data, "result")); if (page == "site") RenderSiteResults(); break;
                 case "history": history = A(V(data, "entries")); historyError = Empty(S(data, "error")); hasBackup = B(data, "hasBackup"); if (page == "history" || page == "diagnosis") RenderPage(); break;
@@ -198,6 +207,7 @@ namespace NetworkRescue
         {
             report = speed = site = comparison = updateResult = advancedResult = null; advancedSamples.Clear(); ResetSpeed(); dnsResults.Clear(); siteProbes.Clear();
             portalLogin = null;
+            dnsQuality = null;
             history = operationDetails = new object[0]; adapterRows = null; adapterTimestamp = ""; chosen.Clear(); beginnerChosen.Clear(); currentChosen.Clear(); specialChosen.Clear();
             advancedOutput = adaptersOutput = connectionsOutput = ""; noticeText = null; historyError = null;
         }
@@ -351,7 +361,7 @@ namespace NetworkRescue
         }
         private void SizeHeading() { if (headingGrid == null || headingGrid.ActualWidth <= 0 || stateText == null) return; stateText.Measure(new Size(Double.PositiveInfinity, Double.PositiveInfinity)); titleText.MaxWidth = Math.Max(85, headingGrid.ActualWidth - stateText.DesiredSize.Width - 18); }
         private static string NormalizedOperation(string value) { return value == "adapters" || value == "connections" ? "advanced" : value; }
-        private bool CanStop() { return new[] { "diagnose", "speed", "advanced", "monitor", "dnscompare", "site", "adapters", "connections", "checkUpdates" }.Contains(busy); }
+        private bool CanStop() { return new[] { "diagnose", "speed", "advanced", "monitor", "dnscompare", "dnsquality", "site", "adapters", "connections", "checkUpdates" }.Contains(busy); }
         private void Stop() { if (!CanStop() || cancelled) return; cancelled = true; footer.Text = T("stopping"); UpdateLocks(); Request("cancel", null); }
         private void Request(string command, Dictionary<string, object> values) { if (command != "cancel") ClearNotice(); Action<string, Dictionary<string, object>> handler = CommandRequested; if (handler != null) handler(command, values ?? new Dictionary<string, object>()); }
         private void Start(string command, Dictionary<string, object> values)
@@ -665,6 +675,7 @@ namespace NetworkRescue
             if (results == null) return; results.Children.Clear(); WrapPanel stats = new WrapPanel(); AddMetric(stats, T("download"), Number(V(speed, "DownloadMbps")) + " Mbps"); AddMetric(stats, T("upload"), Number(V(speed, "UploadMbps")) + " Mbps"); AddMetric(stats, T("latency"), Number(V(speed, "LatencyMs")) + " ms"); results.Children.Add(stats);
             StackPanel chartCard = Card(results, T("speedAverageChartTitle"), T("speedAverageChartHint")); WrapPanel legend = new WrapPanel(); TextBlock downloadLegend = Text("— " + T("download"), 12, Purple, true); downloadLegend.Margin = new Thickness(0, 0, 22, 6); legend.Children.Add(downloadLegend); legend.Children.Add(Text("— " + T("upload"), 12, BrushOf("#168F97"), true)); chartCard.Children.Add(legend); chartCard.Children.Add(Text(T("speedChartMbps"), 11, Muted));
             speedChart = new Canvas { Height = 210, Background = BrushOf("#F8F5F0"), ClipToBounds = true }; speedChart.SizeChanged += delegate { DrawSpeedChart(); }; chartCard.Children.Add(speedChart); chartCard.Children.Add(Text(T("speedPhaseSeconds"), 11, Muted)); DrawSpeedChart();
+            RenderSpeedLatency();
             StackPanel card = Card(results, T("speedResultTitle"), ""); AutomationProperties.SetAutomationId(card, "speed-result-card");
             bool completed = B(speed, "Completed"), running = busy == "speed" && !cancelled;
             string state = speed == null ? T(running ? "speedStarting" : "notStarted") : S(speed, "State");
@@ -679,6 +690,53 @@ namespace NetworkRescue
                 else { TextBlock reason = Text(S(speed, "Detail"), 12, running ? Muted : BrushOf("#865A18")); AutomationProperties.SetAutomationId(reason, "speed-result-reason"); card.Children.Add(reason); }
             }
             card.Children.Add(Text(T("speedResultNote"), 11, Muted));
+        }
+        private static string TypedCode(Dictionary<string, object> value, string key, string[] codes)
+        {
+            string code = S(value, key); int number; return Int32.TryParse(code, NumberStyles.Integer, CultureInfo.InvariantCulture, out number) && number >= 0 && number < codes.Length ? codes[number] : code;
+        }
+        private string OptionalNumber(object value, string unit) { return value == null ? "—" : Number(value) + unit; }
+        private void RenderSpeedLatency()
+        {
+            StackPanel card = Card(results, U("speedLatencyTitle"), U("speedLatencyHint")); AutomationProperties.SetAutomationId(card, "speed-latency-card");
+            System.Windows.Controls.Primitives.UniformGrid phases = new System.Windows.Controls.Primitives.UniformGrid { Columns = 1 }; phases.SizeChanged += delegate { phases.Columns = phases.ActualWidth >= 900 ? 3 : 1; }; card.Children.Add(phases);
+            string[] names = { "Idle", "Download", "Upload" }, colors = { "#7754A6", "#3B46B9", "#168F97" };
+            for (int i = 0; i < names.Length; i++)
+            {
+                string phase = names[i]; Dictionary<string, object> statistics = D(V(speed, phase + "Latency")); StackPanel panel = Card(phases, U("speedLatency" + phase), ""); AutomationProperties.SetAutomationId(panel, "speed-latency-" + phase.ToLowerInvariant());
+                string status = TypedCode(statistics, "Status", new[] { "NotStarted", "Sampling", "InsufficientSamples", "Ready", "Interrupted" });
+                panel.Children.Add(Text(U(status == "InsufficientSamples" ? "qualityInsufficient" : "qualityStatus" + (new[] { "NotStarted", "Sampling", "Ready", "Interrupted" }.Contains(status) ? status : "NotStarted")), 11, Muted));
+                bool sufficient = statistics != null && N(statistics, "SuccessCount") >= 3;
+                panel.Children.Add(EvidenceField(U("qualityMedian"), OptionalNumber(sufficient ? V(statistics, "MedianMs") : null, " ms"))); panel.Children.Add(EvidenceField(U("qualityP95"), OptionalNumber(sufficient ? V(statistics, "P95Ms") : null, " ms")));
+                if (i > 0) panel.Children.Add(EvidenceField(U("qualityDelta"), OptionalNumber(sufficient && N(D(V(speed, "IdleLatency")), "SuccessCount") >= 3 ? V(speed, phase + "LatencyDeltaMs") : null, " ms")));
+                panel.Children.Add(EvidenceField(U("qualitySampleCount"), statistics == null ? "—" : S(statistics, "SuccessCount") + " / " + (N(statistics, "SuccessCount") + N(statistics, "FailureCount")).ToString("0", CultureInfo.CurrentCulture)));
+                List<Dictionary<string, object>> points = A(V(statistics, "Samples")).Select(D).Where(delegate(Dictionary<string, object> sample) { return sample != null; }).Select(delegate(Dictionary<string, object> sample) { return Values("TimeUtc", V(sample, "StartedUtc"), "Value", TypedCode(sample, "State", new[] { "Success", "Failed" }) == "Success" ? V(sample, "Milliseconds") : null); }).ToList();
+                Canvas latencyChart = new Canvas { Height = 185, Background = BrushOf("#F8F5F0"), ClipToBounds = true }; AutomationProperties.SetAutomationId(latencyChart, "speed-latency-chart-" + phase.ToLowerInvariant()); string color = colors[i]; latencyChart.SizeChanged += delegate { DrawObservationChart(latencyChart, points, new[] { "Value" }, new[] { color }, 0, "qualityNoSamples", false); }; panel.Children.Add(Text(U("qualityLatencyAxis"), 11, Muted)); panel.Children.Add(latencyChart); DrawObservationChart(latencyChart, points, new[] { "Value" }, new[] { color }, 0, "qualityNoSamples", false);
+            }
+            card.Children.Add(Text(U("qualityTimeAxis"), 11, Muted));
+        }
+        private void DrawObservationChart(Canvas canvas, List<Dictionary<string, object>> rows, string[] fields, string[] colors, double fixedMax, string emptyKey, bool showEvent)
+        {
+            canvas.Children.Clear(); double width = Math.Max(200, canvas.ActualWidth), bottom = canvas.Height - 29, top = 15;
+            List<Dictionary<string, object>> timed = rows.Where(delegate(Dictionary<string, object> row) { DateTime utc; return TryUtc(V(row, "TimeUtc"), out utc); }).OrderBy(delegate(Dictionary<string, object> row) { DateTime utc; TryUtc(V(row, "TimeUtc"), out utc); return utc; }).ToList();
+            Func<Dictionary<string, object>, string, bool> valid = delegate(Dictionary<string, object> row, string field) { double value = N(row, field); return V(row, field) != null && value >= 0 && !Double.IsNaN(value) && !Double.IsInfinity(value); };
+            List<Dictionary<string, object>> measured = timed.Where(delegate(Dictionary<string, object> row) { return fields.Any(delegate(string field) { return valid(row, field); }); }).ToList();
+            double maximum = fixedMax > 0 ? fixedMax : Math.Max(10, measured.SelectMany(delegate(Dictionary<string, object> row) { return fields.Where(delegate(string field) { return valid(row, field); }).Select(delegate(string field) { return N(row, field); }); }).DefaultIfEmpty(0).Max()) * 1.1;
+            for (int i = 0; i < 3; i++) { double y = top + i * (bottom - top) / 2; canvas.Children.Add(new System.Windows.Shapes.Line { X1 = 39, X2 = width - 12, Y1 = y, Y2 = y, Stroke = Line }); TextBlock tick = Text(Number(maximum * (2 - i) / 2), 9, Muted); tick.Width = 35; tick.TextAlignment = TextAlignment.Right; Canvas.SetLeft(tick, 0); Canvas.SetTop(tick, y - 7); canvas.Children.Add(tick); }
+            if (measured.Count == 0) { TextBlock empty = Text(U(emptyKey), 12, Muted); empty.Width = width - 60; empty.TextAlignment = TextAlignment.Center; Canvas.SetLeft(empty, 48); Canvas.SetTop(empty, (top + bottom) / 2 - 15); canvas.Children.Add(empty); return; }
+            DateTime first, last; TryUtc(V(timed[0], "TimeUtc"), out first); TryUtc(V(timed[timed.Count - 1], "TimeUtc"), out last); double duration = (last - first).TotalMilliseconds;
+            Func<DateTime, double> xpos = delegate(DateTime utc) { return duration > 0 ? 42 + (utc - first).TotalMilliseconds / duration * (width - 56) : (width + 28) / 2; };
+            for (int field = 0; field < fields.Length; field++)
+            {
+                Polyline line = null; DateTime previous = DateTime.MinValue; foreach (Dictionary<string, object> row in timed)
+                {
+                    if (!valid(row, fields[field])) { line = null; continue; } DateTime utc; TryUtc(V(row, "TimeUtc"), out utc); if (previous != DateTime.MinValue && (utc - previous).TotalSeconds > 10) line = null; previous = utc; double value = N(row, fields[field]), x = xpos(utc), y = bottom - Math.Min(maximum, value) / maximum * (bottom - top);
+                    if (line == null) { line = new Polyline { Stroke = BrushOf(colors[field]), StrokeThickness = 2 }; canvas.Children.Add(line); } line.Points.Add(new Point(x, y));
+                    Ellipse dot = new Ellipse { Width = 5, Height = 5, Fill = BrushOf(colors[field]), ToolTip = utc.ToLocalTime().ToString("HH:mm:ss.fff", CultureInfo.CurrentCulture) + " · " + Number(value) }; Canvas.SetLeft(dot, x - 2.5); Canvas.SetTop(dot, y - 2.5); canvas.Children.Add(dot);
+                }
+            }
+            foreach (bool end in new[] { false, true }) { TextBlock time = Text((end ? last : first).ToLocalTime().ToString("HH:mm:ss", CultureInfo.CurrentCulture), 9, Muted); time.Width = 80; time.TextAlignment = end ? TextAlignment.Right : TextAlignment.Left; Canvas.SetLeft(time, end ? width - 94 : 42); Canvas.SetTop(time, bottom + 8); canvas.Children.Add(time); }
+            DateTime selected; if (showEvent && duration > 0 && TryUtc(V(selectedMonitorEvent, "TimeUtc"), out selected) && selected >= first && selected <= last) { double x = xpos(selected); System.Windows.Shapes.Line marker = new System.Windows.Shapes.Line { X1 = x, X2 = x, Y1 = top, Y2 = bottom, Stroke = BrushOf("#B67B24"), StrokeThickness = 1.5, StrokeDashArray = new DoubleCollection(new[] { 4.0, 3.0 }), ToolTip = U("monitorReplaySelectedTime") + " · " + DateText(selected) }; AutomationProperties.SetAutomationId(marker, "wifi-replay-marker"); canvas.Children.Add(marker); }
         }
         private void ResetSpeed() { speed = previousSpeed = null; speedPoints.Clear(); }
         private void RecordSpeedPoint(Dictionary<string, object> next)
@@ -931,7 +989,7 @@ namespace NetworkRescue
             if (rows.Count == 0) { pendingMonitorHistory = ""; Notice(U("monitorHistoryReadError")); return; }
             SaveInputs(); monitorSessionTargets.Clear(); monitorSessionTargets.AddRange(rows); loadedMonitorHistory = id; pendingMonitorHistory = ""; selectedMonitorEvent = null; historyReplay = null; historyReplaySamples.Clear();
             monitorSessionIntervalMs = Math.Max(1000, (int)N(data, "intervalMs")); monitorEvents.Clear(); monitorEventRows.Clear(); monitorEventTotal = (int)N(data, "totalEvents"); monitorEventTruncated = B(data, "truncated"); monitorFailed = S(data, "state") == "Failed";
-            monitor = null; samples.Clear(); ApplyMonitorEndSnapshots(data); if (page == "monitor") RenderPage();
+            monitor = null; samples.Clear(); wifiSamples.Clear(); wifiTotalSamples = 0; wifiTruncated = false; wifiSupported = B(data, "wifiSupported"); ApplyMonitorEndSnapshots(data); if (page == "monitor") RenderPage();
         }
         private void SelectMonitorEvent(Dictionary<string, object> selected)
         {
@@ -945,6 +1003,7 @@ namespace NetworkRescue
             if (results == null || page != "monitor") return; results.Children.Clear(); monitorGrid = new Grid(); AutomationProperties.SetAutomationId(monitorGrid, "monitor-results-grid"); results.Children.Add(monitorGrid);
             foreach (MonitorRow row in ActiveMonitorTargets()) { StackPanel holder = new StackPanel(); monitorGrid.Children.Add(holder); row.Result = Card(holder, "", ""); RenderMonitorCard(row); }
             monitorGrid.SizeChanged += delegate { ArrangeMonitorCards(); }; ArrangeMonitorCards();
+            wifiPanel = Card(results, U("wifiStabilityTitle"), U("wifiStabilityHint")); AutomationProperties.SetAutomationId(wifiPanel, "wifi-stability-card"); RenderWifiStability();
             StackPanel timeline = Card(results, T("monitorTimelineTitle"), T("monitorTimelineHint")); monitorEventCount = Text("", 12, Muted); AutomationProperties.SetAutomationId(monitorEventCount, "monitor-event-count"); timeline.Children.Add(monitorEventCount);
             monitorTimelineUpdating = true; monitorEventRows.Clear(); foreach (Dictionary<string, object> value in monitorEvents) monitorEventRows.Add(MonitorEventRow(value)); monitorTimelineUpdating = false;
             DataGrid table = ReadOnlyTable("monitor-timeline"); table.Height = 300; table.MinHeight = 150; table.EnableColumnVirtualization = true; table.CanUserSortColumns = false; table.ClipboardCopyMode = DataGridClipboardCopyMode.IncludeHeader; VirtualizingStackPanel.SetIsVirtualizing(table, true); VirtualizingStackPanel.SetVirtualizationMode(table, System.Windows.Controls.VirtualizationMode.Recycling); ScrollViewer.SetCanContentScroll(table, true);
@@ -966,7 +1025,7 @@ namespace NetworkRescue
             if (monitorGrid == null) return; int columns = monitorGrid.ActualWidth >= 700 && ActiveMonitorTargets().Count > 1 ? 2 : 1; monitorGrid.ColumnDefinitions.Clear(); monitorGrid.RowDefinitions.Clear(); for (int i = 0; i < columns; i++) monitorGrid.ColumnDefinitions.Add(new ColumnDefinition());
             for (int i = 0; i < monitorGrid.Children.Count; i++) { if (i % columns == 0) monitorGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); FrameworkElement child = (FrameworkElement)monitorGrid.Children[i]; Grid.SetRow(child, i / columns); Grid.SetColumn(child, i % columns); child.Margin = new Thickness(0, 0, columns == 2 && i % 2 == 0 ? 14 : 0, 0); }
         }
-        private void RefreshMonitorCards() { if (page == "monitor") foreach (MonitorRow row in ActiveMonitorTargets()) RenderMonitorCard(row); }
+        private void RefreshMonitorCards() { if (page == "monitor") { foreach (MonitorRow row in ActiveMonitorTargets()) RenderMonitorCard(row); RenderWifiStability(); } }
         private void RenderMonitorCard(MonitorRow row)
         {
             if (page != "monitor" || row.Result == null) return; StackPanel card = row.Result; card.Children.Clear(); Dictionary<string, object> value = row.Summary; bool web = value == null || S(value, "Method").Length == 0 ? row.Method == "https" : S(value, "Method").Equals("HTTPS", StringComparison.OrdinalIgnoreCase);
@@ -1011,6 +1070,33 @@ namespace NetworkRescue
             if (loadedMonitorHistory.Length == 0 || selectedMonitorEvent == null) return row.Samples;
             List<Dictionary<string, object>> replaySamples; return historyReplay != null && historyReplaySamples.TryGetValue(row.Id, out replaySamples) ? replaySamples : new List<Dictionary<string, object>>();
         }
+        private List<Dictionary<string, object>> WifiDisplaySamples()
+        {
+            if (selectedMonitorEvent == null) return wifiSamples;
+            if (loadedMonitorHistory.Length > 0) return historyReplay == null ? new List<Dictionary<string, object>>() : A(V(historyReplay, "wifiSamples")).Select(D).Where(delegate(Dictionary<string, object> sample) { return sample != null; }).ToList();
+            DateTime selected; if (!TryUtc(V(selectedMonitorEvent, "TimeUtc"), out selected)) return new List<Dictionary<string, object>>();
+            return wifiSamples.Where(delegate(Dictionary<string, object> sample) { DateTime utc; return TryUtc(V(sample, "TimeUtc"), out utc) && Math.Abs((utc - selected).TotalSeconds) <= 10; }).ToList();
+        }
+        private void RenderWifiStability()
+        {
+            if (page != "monitor" || wifiPanel == null) return; wifiPanel.Children.Clear(); wifiPanel.Children.Add(Text(U("wifiStabilityTitle"), 18, Ink, true)); wifiPanel.Children.Add(Text(U("wifiStabilityHint"), 12, Muted));
+            if (!wifiSupported) { wifiPanel.Children.Add(Text(U("wifiHistoryUnsupported"), 12, Muted)); return; }
+            wifiPanel.Children.Add(EvidenceField(U("wifiPreviewCount"), wifiSamples.Count.ToString(CultureInfo.CurrentCulture) + " / " + wifiTotalSamples.ToString(CultureInfo.CurrentCulture)));
+            if (wifiTruncated) wifiPanel.Children.Add(Text(U("wifiTruncated"), 12, BrushOf("#865A18"))); if (selectedMonitorEvent != null) wifiPanel.Children.Add(Text(U("wifiReplayHint"), 12, Muted));
+            List<Dictionary<string, object>> displayed = WifiDisplaySamples(); Dictionary<string, object> latest = displayed.LastOrDefault(); if (latest == null) { wifiPanel.Children.Add(Text(U("wifiNoSamples"), 12, Muted)); return; }
+            bool denied = N(latest, "NativeErrorCode") == 5 || A(V(latest, "Interfaces")).Select(D).Any(delegate(Dictionary<string, object> link) { return N(link, "QueryError") == 5; }); string state = S(latest, "StateCode");
+            wifiPanel.Children.Add(Text(U(denied ? "wifiAccessDenied" : state == "NoWirelessInterface" ? "wifiNotApplicable" : state == "NotConnected" ? "wifiDisconnected" : state == "Available" ? "wifiAvailable" : state == "Partial" ? "wifiPartial" : "wifiUnavailable"), 13, state == "Available" ? Purple : Muted, true)); wifiPanel.Children.Add(EvidenceField(U("wifiSampleTime"), DateText(V(latest, "TimeUtc"))));
+            string[] interfaces = displayed.SelectMany(delegate(Dictionary<string, object> sample) { return A(V(sample, "Interfaces")).Select(D).Where(delegate(Dictionary<string, object> link) { return link != null; }).Select(delegate(Dictionary<string, object> link) { return S(link, "InterfaceId"); }); }).Where(delegate(string id) { return id.Length > 0; }).Distinct().OrderBy(delegate(string id) { return id; }).ToArray();
+            for (int i = 0; i < interfaces.Length; i++)
+            {
+                string id = interfaces[i]; StackPanel panel = Card(wifiPanel, U("wifiInterfaceLabel") + " " + (i + 1), ""); List<Dictionary<string, object>> points = new List<Dictionary<string, object>>();
+                foreach (Dictionary<string, object> sample in displayed) { Dictionary<string, object> link = A(V(sample, "Interfaces")).Select(D).FirstOrDefault(delegate(Dictionary<string, object> value) { return S(value, "InterfaceId") == id; }); bool readable = S(link, "Readability") == "Available"; points.Add(Values("TimeUtc", V(sample, "TimeUtc"), "Signal", readable ? V(link, "SignalPercent") : null, "Rx", readable && V(link, "RxKbps") != null ? (object)(N(link, "RxKbps") / 1000) : null, "Tx", readable && V(link, "TxKbps") != null ? (object)(N(link, "TxKbps") / 1000) : null)); }
+                panel.Children.Add(Text(U("wifiSignal"), 12, Muted)); Canvas signal = new Canvas { Height = 175, Background = BrushOf("#F8F5F0"), ClipToBounds = true }; AutomationProperties.SetAutomationId(signal, "wifi-signal-chart-" + i); signal.SizeChanged += delegate { DrawObservationChart(signal, points, new[] { "Signal" }, new[] { "#7754A6" }, 100, "wifiNoSamples", true); }; panel.Children.Add(signal); DrawObservationChart(signal, points, new[] { "Signal" }, new[] { "#7754A6" }, 100, "wifiNoSamples", true);
+                panel.Children.Add(Text(U("wifiLinkRates"), 12, Muted)); WrapPanel legend = new WrapPanel(); legend.Children.Add(Text("— " + U("wifiReceiveRate") + "   ", 11, Purple)); legend.Children.Add(Text("— " + U("wifiTransmitRate"), 11, BrushOf("#168F97"))); panel.Children.Add(legend);
+                Canvas rates = new Canvas { Height = 175, Background = BrushOf("#F8F5F0"), ClipToBounds = true }; AutomationProperties.SetAutomationId(rates, "wifi-rate-chart-" + i); rates.SizeChanged += delegate { DrawObservationChart(rates, points, new[] { "Rx", "Tx" }, new[] { "#3B46B9", "#168F97" }, 0, "wifiNoSamples", true); }; panel.Children.Add(rates); DrawObservationChart(rates, points, new[] { "Rx", "Tx" }, new[] { "#3B46B9", "#168F97" }, 0, "wifiNoSamples", true);
+            }
+            if (interfaces.Length > 0) wifiPanel.Children.Add(Text(U("qualityTimeAxis"), 11, Muted));
+        }
         private void RenderMonitorReplay()
         {
             if (page != "monitor" || monitorReplayPanel == null) return; monitorReplayPanel.Children.Clear(); monitorReplayPanel.Children.Add(Text(U("monitorReplayTitle"), 18, Ink, true)); monitorReplayPanel.Children.Add(Text(U("monitorReplayHint"), 12, Muted));
@@ -1042,6 +1128,7 @@ namespace NetworkRescue
         private void ApplyMonitorStarted(Dictionary<string, object> data)
         {
             ClearMonitorHistorySelection();
+            wifiSamples.Clear(); wifiTotalSamples = 0; wifiTruncated = false; wifiSupported = true;
             SaveInputs(); EnsureMonitorTargets(); monitorSessionTargets.Clear(); selectedMonitorEvent = null; int interval; if (Int32.TryParse(monitorInterval, out interval)) monitorSessionIntervalMs = interval; object[] targets = A(V(data, "targets")); List<MonitorRow> started = new List<MonitorRow>();
             if (targets.Length > 0 && targets.Length <= 4)
             {
@@ -1073,6 +1160,8 @@ namespace NetworkRescue
         private void ApplyMonitorEndSnapshots(Dictionary<string, object> data)
         {
             EnsureMonitorSession();
+            if (data.ContainsKey("wifiSamples")) { wifiSamples.Clear(); wifiSamples.AddRange(A(V(data, "wifiSamples")).Select(D).Where(delegate(Dictionary<string, object> sample) { return sample != null; }).Reverse().Take(720).Reverse()); wifiTotalSamples = Math.Max(wifiSamples.Count, (int)N(data, "wifiTotalSamples")); wifiTruncated = B(data, "wifiTruncated") || wifiTotalSamples > wifiSamples.Count; }
+            if (data.ContainsKey("wifiSupported")) wifiSupported = B(data, "wifiSupported");
             if (data.ContainsKey("events"))
             {
                 Dictionary<string, object>[] events = A(V(data, "events")).Select(D).Where(delegate(Dictionary<string, object> value) { return value != null; }).ToArray(); monitorEvents.Clear(); monitorEvents.AddRange(events.Skip(Math.Max(0, events.Length - 500)));
@@ -1122,6 +1211,14 @@ namespace NetworkRescue
         private void RenderDns()
         {
             StackPanel card = Card(body, T("dnsCompareTitle"), T("dnsCompareIntro")); hostInput = Input(dnsHost); dnsInput = Input(dnsServers); card.Children.Add(Field("dnsDomain", hostInput)); card.Children.Add(Field("dnsServers", dnsInput)); card.Children.Add(Text(T("dnsComparePrivacy"), 12, Muted)); card.Children.Add(MakeStartButton("startDnsCompare", "dnscompare", delegate { SaveInputs(); object[] servers = Regex.Split(dnsServers, @"[,;\s]+").Where(delegate(string s) { return s.Length > 0; }).Cast<object>().ToArray(); if (servers.Length < 1 || servers.Length > 4) { Notice(T("dnsCompareInputError")); return; } dnsResults.Clear(); RenderDnsResults(); Start("dnscompare", Values("host", dnsHost, "servers", servers)); })); results = new StackPanel(); body.Children.Add(results); RenderDnsResults();
+            StackPanel qualityControls = Card(body, U("dnsQualityTitle"), U("dnsQualityHint")); body.Children.Remove(results); body.Children.Add(results);
+            dnsQualityRoundsInput = Input(dnsQualityRounds); dnsQualityRoundsInput.MaxLength = 2; AutomationProperties.SetAutomationId(dnsQualityRoundsInput, "dns-quality-rounds"); qualityControls.Children.Add(Field("dnsQualityRounds", dnsQualityRoundsInput, 180)); qualityControls.Children.Add(MakeStartButton("dnsQualityStart", "dnsquality", StartDnsQuality));
+        }
+        private void StartDnsQuality()
+        {
+            SaveInputs(); int rounds; object[] servers = Regex.Split(dnsServers, @"[,;\s]+").Where(delegate(string value) { return value.Length > 0; }).Cast<object>().ToArray();
+            if (!Int32.TryParse(dnsQualityRounds, out rounds) || rounds < 3 || rounds > 10 || servers.Length < 1 || servers.Length > 4) { Notice(U("dnsQualityInputError")); return; }
+            dnsQuality = null; Start("dnsquality", Values("host", dnsHost, "servers", servers, "rounds", rounds)); RenderDnsResults();
         }
         private void RenderDnsResults()
         {
@@ -1145,6 +1242,25 @@ namespace NetworkRescue
                 for (int i = 0; i < grid.Children.Count; i++) { if (i % columns == 0) grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); UIElement child = grid.Children[i]; Grid.SetRow(child, i / columns); Grid.SetColumn(child, i % columns); ((FrameworkElement)child).Margin = new Thickness(0, 0, columns == 2 && i % 2 == 0 ? 14 : 0, 15); }
             };
             grid.SizeChanged += delegate { arrange(); }; arrange();
+            RenderDnsQuality();
+        }
+        private void RenderDnsQuality()
+        {
+            StackPanel card = Card(results, U("dnsQualityTitle"), U("dnsQualityHint")); AutomationProperties.SetAutomationId(card, "dns-quality-results"); string status = S(dnsQuality, "Status");
+            card.Children.Add(Text(U("dnsQuality" + (status == "Running" ? "Running" : status == "Complete" ? "Completed" : status == "Cancelled" ? "Cancelled" : status == "Deadline" ? "Deadline" : dnsQuality == null ? "NotStarted" : "Failed")), 13, Purple, true)); card.Children.Add(Text(U("dnsQualityRatesHint"), 11, Muted));
+            foreach (Dictionary<string, object> server in A(V(dnsQuality, "Servers")).Select(D).Where(delegate(Dictionary<string, object> value) { return value != null; }))
+            {
+                StackPanel panel = Card(card, S(server, "Server"), ""); AutomationProperties.SetAutomationId(panel, "dns-quality-server-" + S(server, "Server")); bool measured = N(server, "CompletedRounds") > 0; panel.Children.Add(EvidenceField(U("dnsQualityCounts"), S(server, "CompletedRounds") + " / " + S(server, "AttemptedRounds") + " / " + S(dnsQuality, "RequestedRounds")));
+                if (!measured) panel.Children.Add(Text(U("dnsQualityNotMeasured"), 12, Muted));
+                foreach (string rate in new[] { "ResponseRatePercent", "ResolutionSuccessRatePercent", "TimeoutRatePercent" }) panel.Children.Add(EvidenceField(U(rate == "ResponseRatePercent" ? "dnsQualityResponseRate" : rate == "ResolutionSuccessRatePercent" ? "dnsQualityResolutionRate" : "dnsQualityTimeoutRate"), OptionalNumber(measured ? V(server, rate) : null, " %")));
+                panel.Children.Add(Text(U("dnsQualityRoundDuration"), 12, Muted)); panel.Children.Add(EvidenceField(U("qualityMedian"), OptionalNumber(measured ? V(server, "MedianMs") : null, " ms"))); panel.Children.Add(EvidenceField(U("qualityP95"), OptionalNumber(measured ? V(server, "P95Ms") : null, " ms")));
+                Dictionary<string, object>[] rows = A(V(server, "Samples")).Select(D).Where(delegate(Dictionary<string, object> sample) { return sample != null; }).Select(delegate(Dictionary<string, object> sample) { string state = S(sample, "Status"); bool completed = state != "Cancelled" && state != "Deadline"; return Values("Time", DateText(V(sample, "TimeUtc")), "Round", V(sample, "Round"), "Duration", OptionalNumber(completed ? V(sample, "DurationMs") : null, " ms"), "DisplayStatus", U(state == "Answered" ? "siteResponded" : state == "Cancelled" ? "dnsQualityCancelled" : state == "Deadline" ? "dnsQualityDeadline" : "unknown"), "StateBrush", Ink); }).ToArray();
+                if (rows.Length > 0) { DataGrid table = ReadOnlyTable("dns-quality-samples-" + S(server, "Server")); table.MaxHeight = 240; AddTableColumn(table, "Time", "monitorEventTime", 1.4, 145); AddTableColumn(table, "Round", "dnsQualityRound", 0.6, 45); AddTableColumn(table, "Duration", "dnsQualityRoundDuration", 1, 120); AddTableColumn(table, "DisplayStatus", "statusColumn", 1, 110); table.ItemsSource = rows; panel.Children.Add(table); }
+                List<Dictionary<string, object>> queries = new List<Dictionary<string, object>>();
+                foreach (Dictionary<string, object> sample in A(V(server, "Samples")).Select(D).Where(delegate(Dictionary<string, object> value) { return value != null; })) foreach (Dictionary<string, object> query in A(V(sample, "Queries")).Select(D).Where(delegate(Dictionary<string, object> value) { return value != null; })) queries.Add(Values("Round", V(sample, "Round"), "QueryType", S(query, "QueryType"), "DisplayStatus", U(S(query, "Status") == "Answered" ? "siteResponded" : "unknown"), "Rcode", OptionalNumber(V(query, "Rcode"), ""), "Addresses", String.Join(Environment.NewLine, A(V(query, "Addresses")).Select(delegate(object address) { return Convert.ToString(address, CultureInfo.InvariantCulture); })), "ErrorCode", S(query, "ErrorCode"), "StateBrush", Ink));
+                if (queries.Count > 0) { DataGrid table = ReadOnlyTable("dns-quality-query-table-" + S(server, "Server")); table.MaxHeight = 240; AddTableColumn(table, "Round", "dnsQualityRound", 0.6, 45); AddTableColumn(table, "QueryType", "dnsQualityQueryType", 0.7, 70); AddTableColumn(table, "DisplayStatus", "statusColumn", 1, 110); DataGridTextColumn rcode = new DataGridTextColumn { Header = "RCODE", Binding = new Binding("[Rcode]"), Width = 70 }; table.Columns.Add(rcode); AddTableColumn(table, "Addresses", "probeAddress", 1.4, 130); AddTableColumn(table, "ErrorCode", "probeError", 1, 120); table.ItemsSource = queries; Expander details = new Expander { Header = U("rawTechnicalDetails"), IsExpanded = false, Content = table, Margin = new Thickness(0, 7, 0, 0) }; AutomationProperties.SetAutomationId(details, "dns-quality-query-details-" + S(server, "Server")); panel.Children.Add(details); }
+            }
+            card.Children.Add(Text(U("dnsQualityLimited"), 11, Muted));
         }
         private void RenderHistory()
         {
@@ -1180,7 +1296,7 @@ namespace NetworkRescue
             if (page == "advanced" && hostInput != null) { toolHost = hostInput.Text.Trim(); toolPort = portInput.Text.Trim(); toolKind = new[] { "ping", "dns", "trace", "tcp" }[Math.Max(0, toolInput.SelectedIndex)]; }
             if (page == "monitor" && intervalInput != null) { foreach (MonitorRow row in monitorTargets) { if (row.HostInput == null) continue; row.Host = row.HostInput.Text.Trim(); row.Method = row.MethodInput.SelectedIndex == 1 ? "icmp" : "https"; row.Proxy = row.RouteInput.SelectedIndex == 0; } monitorInterval = intervalInput.Text.Trim(); monitorCount = countInput.Text.Trim(); if (monitorTargets.Count > 0) { monitorHost = monitorTargets[0].Host; monitorMethod = monitorTargets[0].Method; monitorProxy = monitorTargets[0].Proxy; } }
             if (page == "monitor" && monitorPlanNameInput != null) monitorPlanName = monitorPlanNameInput.Text.Trim();
-            if (page == "dnscompare" && hostInput != null) { dnsHost = hostInput.Text.Trim(); dnsServers = dnsInput.Text.Trim(); }
+            if (page == "dnscompare" && hostInput != null) { dnsHost = hostInput.Text.Trim(); dnsServers = dnsInput.Text.Trim(); if (dnsQualityRoundsInput != null) dnsQualityRounds = dnsQualityRoundsInput.Text.Trim(); }
             if (page == "settings" && repositoryInput != null) { updateRepository = UpdateService.RepositoryOrDefault(repositoryInput.Text); repositoryInput.Text = updateRepository; }
             if (page == "settings" && healthProfileNameInput != null) healthProfileName = healthProfileNameInput.Text.Trim();
         }

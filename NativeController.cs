@@ -23,7 +23,7 @@ namespace NetworkRescue
         private readonly MonitoringHistoryStore monitoringHistory = new MonitoringHistoryStore();
         private MonitoringHistoryRecord selectedMonitoringHistory;
         // Structured evidence can exceed the old limit; keep the sender bounded to the native view's limit.
-        internal const int MaximumUiJsonLength = 4 * 1024 * 1024;
+        internal const int MaximumUiJsonLength = 8 * 1024 * 1024;
         private readonly JavaScriptSerializer json = new JavaScriptSerializer { MaxJsonLength = MaximumUiJsonLength, RecursionLimit = 32 };
         private readonly string settingsRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NetworkRescue");
         private readonly bool startScan;
@@ -43,7 +43,7 @@ namespace NetworkRescue
         private MonitoringSession monitoring;
         private NetworkChangeSnapshot healthyConfiguration;
         private DiagnosticReport healthyReport;
-        internal const string DisplayVersion = "1.1.0";
+        internal const string DisplayVersion = "1.2.0";
         internal sealed class MonitoringSession
         {
             internal readonly object Sync = new object();
@@ -52,6 +52,8 @@ namespace NetworkRescue
             internal readonly MonitorTarget[] Targets;
             internal readonly Dictionary<string, Queue<MonitorSample>> Samples = new Dictionary<string, Queue<MonitorSample>>(StringComparer.Ordinal);
             internal readonly List<MonitorSample> ArchiveSamples = new List<MonitorSample>();
+            internal readonly Queue<WifiStabilitySample> WifiSamples = new Queue<WifiStabilitySample>();
+            internal int WifiTotalSamples;
             internal readonly NetworkChangeTracker Changes = new NetworkChangeTracker();
             internal DateTime StartedUtc = DateTime.UtcNow, EndedUtc;
             internal DateTime NextCheckpointUtc;
@@ -235,6 +237,19 @@ namespace NetworkRescue
                     {
                         var results = await NetworkMonitor.CompareDnsAsync(dnsHost, servers, UiProgress<DnsComparisonResult>(delegate(DnsComparisonResult result) { Emit(new { type = "dnsComparison", result = result }); }), token);
                         foreach (var result in results) Emit(new { type = "dnsComparison", result = result });
+                    }); break;
+                case "dnsquality":
+                    RequireAdvanced();
+                    string qualityHost = TextValue(message, "host", 253);
+                    int rounds = IntValue(message, "rounds", 3, 10);
+                    object qualityServerValue;
+                    object[] qualityServerItems = message.TryGetValue("servers", out qualityServerValue) ? qualityServerValue as object[] : null;
+                    if (qualityServerItems == null || qualityServerItems.Length < 1 || qualityServerItems.Length > 4 || qualityServerItems.Any(x => !(x is string) || ((string)x).Length > 64)) throw new InvalidDataException(U("dnsCompareInputError"));
+                    await Run("dnsquality", async delegate(CancellationToken token)
+                    {
+                        DnsQualityReport quality = await DnsQuality.RunAsync(qualityHost, qualityServerItems.Cast<string>().ToArray(), rounds,
+                            UiProgress<DnsQualityReport>(delegate(DnsQualityReport update) { Emit(new { type = "dnsQuality", result = update }); }), token);
+                        Emit(new { type = "dnsQuality", result = quality });
                     }); break;
                 case "speed":
                     bool useProxy = BoolValue(message, "useProxy");
@@ -425,13 +440,17 @@ namespace NetworkRescue
             monitoring = session;
             selectedMonitoringHistory = null;
             long run = generation;
-            Emit(new { type = "monitorStarted", targets = targets, startedUtc = session.StartedUtc });
+            Emit(new { type = "monitorStarted", targets = targets, startedUtc = session.StartedUtc, wifiSupported = true });
             Emit(new { type = "networkChange", @event = session.Changes.Record("MonitoringStarted", session.StartedUtc) });
             SaveMonitoringCheckpoint(session, "Running");
             Action<NetworkChangeEvent> publish = delegate(NetworkChangeEvent change) { PostForRun(run, delegate { Emit(new { type = "networkChange", @event = change }); }); };
             using (CancellationTokenSource observe = CancellationTokenSource.CreateLinkedTokenSource(token))
             {
                 Task watcher = ObserveConfigurationAsync(session, publish, observe.Token, NetworkChangeReader.Capture);
+                Task wifiWatcher = ObserveWifiAsync(session, delegate(WifiStabilitySample sample, int total)
+                {
+                    PostForRun(run, delegate { Emit(new { type = "wifiSample", sample = sample, totalSamples = total, truncated = total > 720 }); });
+                }, observe.Token, WifiStabilityReader.Capture);
                 System.Runtime.ExceptionServices.ExceptionDispatchInfo failure = null;
                 try
                 {
@@ -464,13 +483,18 @@ namespace NetworkRescue
                 observe.Cancel();
                 try { await watcher; } catch (OperationCanceledException) { }
                 catch (Exception ex) { session.Failed = true; if (failure == null) failure = System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex); }
+                try { await wifiWatcher; } catch (OperationCanceledException) { }
+                catch (Exception ex) { session.Failed = true; if (failure == null) failure = System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex); }
                 session.EndedUtc = DateTime.UtcNow;
                 NetworkChangeEvent ended = session.Changes.Record(session.Cancelled || session.Failed ? "MonitoringStopped" : "MonitoringCompleted", session.EndedUtc);
                 Emit(new { type = "networkChange", @event = ended });
                 SaveMonitoringCheckpoint(session, session.Failed ? "Failed" : session.Cancelled ? "Stopped" : "Completed");
                 object[] series;
                 lock (session.Sync) series = targets.Select(delegate(MonitorTarget target) { return (object)new { TargetId = target.Id, samples = session.Samples[target.Id].ToArray() }; }).ToArray();
-                Emit(new { type = "monitorEnded", cancelled = session.Cancelled, failed = session.Failed, totalEvents = session.Changes.TotalEvents, truncated = session.Changes.TotalEvents > NetworkChangeTracker.MaximumEvents, events = session.Changes.RecentEvents, series = series });
+                WifiStabilitySample[] wifi;
+                lock (session.Sync) wifi = WifiStabilityReader.Clone(session.WifiSamples.ToArray());
+                Emit(new { type = "monitorEnded", cancelled = session.Cancelled, failed = session.Failed, totalEvents = session.Changes.TotalEvents, truncated = session.Changes.TotalEvents > NetworkChangeTracker.MaximumEvents, events = session.Changes.RecentEvents, series = series,
+                    wifiSupported = true, wifiSamples = wifi, wifiTotalSamples = session.WifiTotalSamples, wifiTruncated = session.WifiTotalSamples > wifi.Length });
                 SendMonitoringHistory();
                 if (failure != null) failure.Throw();
             }
@@ -486,7 +510,7 @@ namespace NetworkRescue
                     EndedUtc = session.EndedUtc == default(DateTime) ? DateTime.UtcNow : session.EndedUtc,
                     State = state, IntervalMs = session.IntervalMs, RequestedCount = session.RequestedCount,
                     Targets = session.Targets, Samples = session.ArchiveSamples.ToArray(),
-                    Events = events, TotalEvents = totalEvents };
+                    Events = events, TotalEvents = totalEvents, WifiCollectionEnabled = true, WifiSamples = WifiStabilityReader.Clone(session.WifiSamples.ToArray()), WifiTotalSamples = session.WifiTotalSamples };
             }
         }
 
@@ -526,7 +550,8 @@ namespace NetworkRescue
             Emit(new { type = "monitorHistoryLoaded", id = record.Id, startedUtc = record.StartedUtc, endedUtc = record.EndedUtc,
                 state = record.State, intervalMs = record.IntervalMs, targets = record.Targets,
                 series = record.Targets.Select(delegate(MonitorTarget target) { MonitorSample[] points = record.Samples.Where(delegate(MonitorSample sample) { return sample.TargetId == target.Id; }).ToArray(); return new { TargetId = target.Id, samples = points.Skip(Math.Max(0, points.Length - 300)).ToArray() }; }).ToArray(),
-                events = record.Events, totalEvents = record.TotalEvents, truncated = record.EventsTruncated });
+                events = record.Events, totalEvents = record.TotalEvents, truncated = record.EventsTruncated,
+                wifiSupported = record.WifiCollectionEnabled, wifiSamples = record.WifiSamples, wifiTotalSamples = record.WifiTotalSamples, wifiTruncated = record.WifiTruncated });
         }
 
         internal static object BuildMonitoringReplay(MonitoringHistoryRecord record, int sequence)
@@ -542,6 +567,7 @@ namespace NetworkRescue
                 duration = Math.Max(0, (long)((recovery == null ? record.EndedUtc : recovery.TimeUtc) - selected.TimeUtc).TotalMilliseconds);
             }
             return new { type = "monitorHistoryReplay", id = record.Id, sequence = sequence, durationMs = duration, recovered = recovered,
+                wifiSupported = record.WifiCollectionEnabled, wifiSamples = record.WifiSamples.Where(delegate(WifiStabilitySample wifi) { return Math.Abs((wifi.TimeUtc - selected.TimeUtc).TotalSeconds) <= 10; }).ToArray(), wifiTotalSamples = record.WifiTotalSamples, wifiTruncated = record.WifiTruncated,
                 series = record.Targets.Select(delegate(MonitorTarget target) { return new { TargetId = target.Id,
                     samples = record.Samples.Where(delegate(MonitorSample sample) { return sample.TargetId == target.Id && Math.Abs((sample.TimeUtc - selected.TimeUtc).TotalSeconds) <= seconds; }).ToArray() }; }).ToArray() };
         }
@@ -574,7 +600,79 @@ namespace NetworkRescue
                 output.AppendLine(change.TimeUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss.fff") + " · " + text("monitorEvent" + change.Kind) + " · " + change.TargetHost + " · " + change.AdapterName + " · " + text("monitorSetting" + change.Setting));
                 if (change.Kind == "SettingChanged") output.AppendLine(change.Before + " → " + change.After);
             }
+            AppendWifiText(output, record.WifiSamples, record.WifiCollectionEnabled, record.WifiTotalSamples, text);
             return output.ToString();
+        }
+
+        private static void AppendWifiText(StringBuilder output, WifiStabilitySample[] samples, bool supported, int total, Func<string, string> text)
+        {
+            output.AppendLine(); output.AppendLine(text("wifiStabilityTitle"));
+            if (!supported) { output.AppendLine(text("wifiHistoryUnsupported")); return; }
+            output.AppendLine(text("wifiStabilityHint"));
+            output.AppendLine(text("wifiPreviewCount") + ": " + samples.Length + "/" + total);
+            if (total > samples.Length) output.AppendLine(text("wifiTruncated"));
+            if (samples.Length == 0) output.AppendLine(text("wifiNoSamples"));
+            Dictionary<string, int> aliases = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (WifiStabilitySample sample in samples)
+            {
+                string state = sample.StateCode == "Available" ? "wifiAvailable" : sample.StateCode == "Partial" ? "wifiPartial" : sample.StateCode == "NoWirelessInterface" ? "wifiNotApplicable" : sample.StateCode == "NotConnected" ? "wifiDisconnected" : "wifiUnavailable";
+                output.AppendLine(sample.TimeUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss.fff") + " · " + text(state) + " · " + sample.ErrorCode);
+                foreach (WifiLinkSample link in sample.Interfaces)
+                {
+                    int alias; if (!aliases.TryGetValue(link.InterfaceId, out alias)) { alias = aliases.Count + 1; aliases.Add(link.InterfaceId, alias); }
+                    output.AppendLine(text("wifiInterfaceLabel") + " " + alias + " · " + text("wifiSignal") + ": " + (link.SignalPercent.HasValue ? link.SignalPercent.Value.ToString(System.Globalization.CultureInfo.InvariantCulture) : "—") + " · " +
+                        text("wifiReceiveRate") + ": " + (link.RxKbps.HasValue ? (link.RxKbps.Value / 1000.0).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) : "—") + " Mbps · " +
+                        text("wifiTransmitRate") + ": " + (link.TxKbps.HasValue ? (link.TxKbps.Value / 1000.0).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) : "—") + " Mbps");
+                }
+            }
+        }
+
+        internal static async Task ObserveWifiAsync(MonitoringSession session, Action<WifiStabilitySample, int> publish, CancellationToken token, Func<WifiStabilitySample> capture)
+        {
+            Task<WifiStabilitySample> pending = null;
+            bool stale = false;
+            try
+            {
+                while (true)
+                {
+                    token.ThrowIfCancellationRequested();
+                    System.Diagnostics.Stopwatch clock = System.Diagnostics.Stopwatch.StartNew();
+                    if (pending != null && stale && pending.IsCompleted)
+                    {
+                        try { await pending.ConfigureAwait(false); } catch { }
+                        pending = null; stale = false;
+                    }
+                    if (pending == null) pending = Task.Run(capture);
+                    Task completed = await Task.WhenAny(pending, Task.Delay(3000, token)).ConfigureAwait(false);
+                    token.ThrowIfCancellationRequested();
+                    WifiStabilitySample sample;
+                    if (completed == pending && !stale)
+                    {
+                        try { sample = await pending.ConfigureAwait(false); }
+                        catch { sample = new WifiStabilitySample { TimeUtc = DateTime.UtcNow, StateCode = "Unavailable", ErrorCode = "ReadUnavailable" }; }
+                        pending = null;
+                    }
+                    else
+                    {
+                        stale = true;
+                        sample = new WifiStabilitySample { TimeUtc = DateTime.UtcNow, StateCode = "Unavailable", ErrorCode = "Timeout" };
+                    }
+                    if (sample == null) sample = new WifiStabilitySample { TimeUtc = DateTime.UtcNow, StateCode = "Unavailable", ErrorCode = "ReadUnavailable" };
+                    int total;
+                    lock (session.Sync)
+                    {
+                        session.WifiSamples.Enqueue(WifiStabilityReader.Clone(sample));
+                        if (session.WifiSamples.Count > 720) session.WifiSamples.Dequeue();
+                        total = ++session.WifiTotalSamples;
+                    }
+                    if (publish != null) publish(sample, total);
+                    await Task.Delay(Math.Max(1, 5000 - (int)clock.ElapsedMilliseconds), token).ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                if (pending != null) pending.ContinueWith(delegate(Task<WifiStabilitySample> failed) { var ignored = failed.Exception; }, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            }
         }
 
         internal static async Task ObserveConfigurationAsync(MonitoringSession session, Action<NetworkChangeEvent> publish, CancellationToken token, Func<NetworkChangeSnapshot> capture)
@@ -641,6 +739,7 @@ namespace NetworkRescue
                 if (change.Kind == "SettingChanged") output.AppendLine(change.Before + " → " + change.After);
                 if (!String.IsNullOrEmpty(change.ErrorCode)) output.AppendLine(change.ErrorCode);
             }
+            lock (session.Sync) AppendWifiText(output, WifiStabilityReader.Clone(session.WifiSamples.ToArray()), true, session.WifiTotalSamples, text);
             return output.ToString();
         }
 

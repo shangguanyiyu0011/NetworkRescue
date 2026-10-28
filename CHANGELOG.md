@@ -1,5 +1,15 @@
 # 更新记录
 
+## 1.2.0 · 2026-10-28
+
+[发行页](https://github.com/shangguanyiyu0011/NetworkRescue/releases/tag/v1.2.0)与[同版本对应源码](https://github.com/shangguanyiyu0011/NetworkRescue/tree/v1.2.0)。产品版本 1.2.0，程序集/文件版本 1.2.0.0。
+
+- 测速增加空闲/下载/上传三个阶段延迟样本、中位数、p95 和相对空闲增量。样本不足不补成 0；仅反映测试节点路径，不能确认路由器因果。
+- 手动监测期间约每 5 秒采集 WLAN 当前连接信号、链路速率及 UTC 时间线，最多 720 个快照、每次最多 8 接口，可与无应答事件联查。不存 SSID/BSSID/adapterName，不改 WLAN 权限、服务或信道。监测历史 schema 2 兼容 1.1 schema 1。
+- DNS 稳定性支持显式 1 域名、1–4 服务器、3–10 轮默认 5 轮及 60 秒上限，分开显示响应率、解析结果、超时率。每轮延迟是 A+AAAA 总耗时，不是单查询 RTT；说明缓存影响与域名特定性，不自动改 DNS、不凭单次最快推荐。
+- 保留 1.1 三项功能和四种修复范围；不增加托盘/后台常驻。
+- 预期 20 套检查（最终以构建为准），本版实际结果待验证，见 [1.2 验证记录](docs/RELEASE-READINESS.v1.2.md)。以下历史版本记录与旧截图不转作本版通过证据。
+
 ## 1.1.0 · 2026-10-28
 
 [发行页](https://github.com/shangguanyiyu0011/NetworkRescue/releases/tag/v1.1.0)与[同版本对应源码](https://github.com/shangguanyiyu0011/NetworkRescue/tree/v1.1.0)。产品版本 1.1.0，程序集/文件版本 1.1.0.0。

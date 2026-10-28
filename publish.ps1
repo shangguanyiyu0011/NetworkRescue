@@ -2,7 +2,7 @@ param([switch]$SkipBuild, [ValidateSet('x64','x86')][string]$Architecture = 'x64
 $ErrorActionPreference = 'Stop'
 if (-not $SkipBuild) { & (Join-Path $PSScriptRoot 'build.ps1') -Architecture $Architecture }
 $taskBuildDir = Join-Path $PSScriptRoot ('build-native-' + $Architecture)
-$taskName = 'NetworkRescue-v1.1.0-win-' + $Architecture
+$taskName = 'NetworkRescue-v1.2.0-win-' + $Architecture
 $taskDist = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'dist'))
 $taskStage = Join-Path $taskDist ('.native-package-' + [Guid]::NewGuid().ToString('N'))
 $taskFolder = Join-Path $taskDist $taskName
@@ -14,10 +14,10 @@ foreach ($taskLanguage in @('zh-CN','zh-TW','en','ja','ko','de','fr','es','pt','
     $taskFiles[$taskRelative]=Join-Path $taskBuildDir $taskRelative
     if($taskLanguage -ne 'zh-CN') { $taskRelative='i18n/messages.'+$taskLanguage+'.json'; $taskFiles[$taskRelative]=Join-Path $taskBuildDir $taskRelative }
 }
-foreach($taskRelative in @('docs/USAGE.zh-CN.txt','docs/RELEASE-READINESS.v1.md','docs/RELEASE-READINESS.v1.1.md','docs/RELEASE-NOTES.v1.1.md','THIRD_PARTY_NOTICES.md','LICENSE')) { $taskFiles[$taskRelative]=Join-Path $PSScriptRoot $taskRelative }
+foreach($taskRelative in @('docs/USAGE.zh-CN.txt','docs/RELEASE-READINESS.v1.md','docs/RELEASE-READINESS.v1.1.md','docs/RELEASE-NOTES.v1.1.md','docs/RELEASE-READINESS.v1.2.md','docs/RELEASE-NOTES.v1.2.md','THIRD_PARTY_NOTICES.md','LICENSE')) { $taskFiles[$taskRelative]=Join-Path $PSScriptRoot $taskRelative }
 foreach($taskSource in $taskFiles.Values) { if(-not(Test-Path -LiteralPath $taskSource -PathType Leaf)){throw ('Missing native package file: '+$taskSource)} }
 $taskExe=Join-Path $taskBuildDir 'NetworkRescue.exe'
-if([Reflection.AssemblyName]::GetAssemblyName($taskExe).Version.ToString() -ne '1.1.0.0'){throw 'Wrong native application assembly version'}
+if([Reflection.AssemblyName]::GetAssemblyName($taskExe).Version.ToString() -ne '1.2.0.0'){throw 'Wrong native application assembly version'}
 $taskReader=[IO.BinaryReader]::new([IO.File]::OpenRead($taskExe))
 try {
     if($taskReader.ReadUInt16() -ne 0x5a4d){throw 'Missing MZ header'}

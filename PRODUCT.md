@@ -1,6 +1,6 @@
-# 断网急救箱 · Network Rescue 1.1.0
+# 断网急救箱 · Network Rescue 1.2.0
 
-开发与维护：上官一羽。Windows 本地网络诊断与针对性修复工具，GPL-3.0-only。仓库与同版本对应源码见 [v1.1.0](https://github.com/shangguanyiyu0011/NetworkRescue/tree/v1.1.0)，使用入口见 [README](README.md)。
+开发与维护：上官一羽。Windows 本地网络诊断与针对性修复工具，GPL-3.0-only。仓库与同版本对应源码见 [v1.2.0](https://github.com/shangguanyiyu0011/NetworkRescue/tree/v1.2.0)，使用入口见 [README](README.md)。
 
 ## 产品流程
 
@@ -23,6 +23,14 @@
 - 网站专项的 IPv4/IPv6 HTTP(S) 验证分别强制使用相应地址族已解析地址，保留原域名与默认 TLS 验证，每族最多 2 地址、总计 3 秒。无 AAAA 时 IPv6 不适用，DNS 未确认不伪造成功；部分地址未确认不能证明整个协议失败，也不自动禁用协议。
 - 疑似门户仅凭证据展示手动入口；用户确认后由系统浏览器打开 Windows 网络认证触发页。它不是已确认的实际门户，不自动登录、不提交凭据；认证后用户点击诊断复测。
 
+## 1.2 稳定性观测
+
+- **负载期间延迟**：测速分别记录空闲、下载和上传三个阶段的真实延迟样本，显示中位数、p95 与相对空闲阶段的增量。样本不足明确标注，不补成 0；仅反映到测试节点的路径，不能据此确认路由器导致延迟。
+- **Wi-Fi 稳定性时间线**：仅在手动监测期间，约每 5 秒只读采集 WLAN 当前连接的信号、链路速率及 UTC 时间，最多保留 720 个采集快照、每次最多 8 个接口，可与无应答事件联查。不存 SSID/BSSID/网卡名称，不更改 WLAN 权限、服务或信道。
+- **DNS 稳定性**：显式指定 1 个域名与 1–4 个 DNS 服务器，运行 3–10 轮（默认 5 轮），总时限 60 秒。分别显示响应率、解析结果及超时率；每轮延迟为 A+AAAA 查询的总耗时，不是单次查询 RTT。结果受缓存影响且只针对该域名，不自动改 DNS，也不凭单次最快结果推荐服务器。
+
+监测历史 schema 2 保存 Wi-Fi 时间线并兼容读取 1.1 schema 1；旧记录无此字段时显示缺失，不补造观测。原有加密、容量、检查点与损坏保护边界不变；不增加托盘或后台常驻。
+
 ## 健康快照与常用设置
 
 健康快照最多 20 个，名称最长 64 字符；需最近 5 分钟内成功联网诊断，保存前配置相同且读取完整，否则要求重新诊断。正常诊断卡直接按本地时间自动命名保存，同秒重名加序号；设置内可手动命名。比较只展示去秘密后的代理 authority、DNS/IP、配置网关与网卡状态，不判断差异就是故障、不自动还原。
@@ -41,8 +49,8 @@
 
 ## 交付与验证
 
-Windows 10 22H2 x86/x64、Windows 11 x64，系统 .NET Framework 4.8；便携 WPF 包无需 WebView2/SDK/Node/Python，不恢复 NuGet、不下载运行时、不复制系统 DLL。C# 5，15 核心 + Controller + Window + SoftDialog，共 18 套检查。构建与打包命令见 [CONTRIBUTING](CONTRIBUTING.md)。
+Windows 10 22H2 x86/x64、Windows 11 x64，系统 .NET Framework 4.8；便携 WPF 包无需 WebView2/SDK/Node/Python，不恢复 NuGet、不下载运行时、不复制系统 DLL。C# 5，17 核心 + Controller + Window + SoftDialog，预期共 20 套检查（最终以构建为准）。构建与打包命令见 [CONTRIBUTING](CONTRIBUTING.md)。
 
-1.1.0 产品版本为 1.1.0、程序集/文件版本为 1.1.0.0，四种修复范围不变。18 套检查、双架构包与新功能的实际结果及验证边界见[1.1 验证记录](docs/RELEASE-READINESS.v1.1.md)。1.0.0 的双架构 16 套、x64 3318 项/x86 3316 项及首次上传/RC5 仍保留原产物绑定，仅见[历史验证记录](docs/RELEASE-READINESS.v1.md)，不得转作本版新结果。
+1.2.0 产品版本为 1.2.0、程序集/文件版本为 1.2.0.0，四种修复范围不变。新增负载期间延迟、Wi-Fi 时间线和 DNS 稳定性。20 套检查、双架构包与新功能实际结果及验证边界见[1.2 验证记录](docs/RELEASE-READINESS.v1.2.md)。[1.1 验证](docs/RELEASE-READINESS.v1.1.md)与[更早历史](docs/RELEASE-READINESS.v1.md)保留原产物绑定，不得转作本版新结果。
 
 自有代码 GPL-3.0-only，官方免费不售激活码；依 GPL 合规收费分发允许，举报对象是冒充官方或收费激活。发布同版本对应源码，第三方/系统边界见 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES.md)。

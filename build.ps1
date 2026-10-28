@@ -14,7 +14,7 @@ foreach ($taskReference in @('WPF\PresentationFramework.dll','WPF\PresentationCo
     if (-not (Test-Path -LiteralPath $taskReferencePath)) { throw ('Windows .NET WPF component missing: ' + $taskReference) }
     $taskReferences += '/r:' + $taskReferencePath
 }
-$taskCoreNames = @('Localization.cs','Engine.cs','SystemChecks.cs','SpeedTest.cs','AdvancedTools.cs','DiagnosticInsights.cs','NetworkMonitor.cs','NetworkChangeTimeline.cs','NetworkWorkspace.cs','ConnectionProcesses.cs','RepairHistory.cs','SiteDiagnostics.cs','UpdateService.cs','MonitoringHistory.cs','PortalLogin.cs')
+$taskCoreNames = @('Localization.cs','Engine.cs','SystemChecks.cs','SpeedTest.cs','AdvancedTools.cs','DiagnosticInsights.cs','NetworkMonitor.cs','NetworkChangeTimeline.cs','NetworkWorkspace.cs','ConnectionProcesses.cs','RepairHistory.cs','SiteDiagnostics.cs','UpdateService.cs','MonitoringHistory.cs','PortalLogin.cs','WifiStability.cs','DnsQuality.cs')
 $taskCoreSources = $taskCoreNames | ForEach-Object { Join-Path $PSScriptRoot $_ }
 $taskAppSources = @('Program.cs','NativeController.cs','NativeWindow.cs','NativeUiText.cs','SoftDialog.cs') | ForEach-Object { Join-Path $PSScriptRoot $_ }
 $taskAppSources += $taskCoreSources
@@ -38,7 +38,7 @@ foreach ($taskLanguage in @('zh-CN','zh-TW','en','ja','ko','de','fr','es','pt','
     }
 }
 if (-not $SkipTests) {
-    foreach ($taskSuite in @('Engine','SystemChecks','SpeedTest','AdvancedTools','Localization','DiagnosticInsights','NetworkMonitor','NetworkChangeTimeline','NetworkWorkspace','ConnectionProcesses','RepairHistory','SiteDiagnostics','UpdateService','MonitoringHistory','PortalLogin')) {
+    foreach ($taskSuite in @('Engine','SystemChecks','SpeedTest','AdvancedTools','Localization','DiagnosticInsights','NetworkMonitor','NetworkChangeTimeline','NetworkWorkspace','ConnectionProcesses','RepairHistory','SiteDiagnostics','UpdateService','MonitoringHistory','PortalLogin','WifiStability','DnsQuality')) {
         $taskTestSource = Join-Path $PSScriptRoot ($taskSuite + 'Tests.cs')
         $taskTestExe = Join-Path $taskBuildDir ($taskSuite + 'Checks.exe')
         & $taskCompiler /nologo /codepage:65001 /langversion:5 /target:exe "/platform:$Architecture" "/out:$taskTestExe" $taskReferences $taskCoreSources $taskTestSource
