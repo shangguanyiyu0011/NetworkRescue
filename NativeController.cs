@@ -20,6 +20,8 @@ namespace NetworkRescue
         private readonly NativeWindow view;
         private readonly RescueEngine engine = new RescueEngine();
         private readonly RepairHistoryStore history = new RepairHistoryStore();
+        private readonly MonitoringHistoryStore monitoringHistory = new MonitoringHistoryStore();
+        private MonitoringHistoryRecord selectedMonitoringHistory;
         // Structured evidence can exceed the old limit; keep the sender bounded to the native view's limit.
         internal const int MaximumUiJsonLength = 4 * 1024 * 1024;
         private readonly JavaScriptSerializer json = new JavaScriptSerializer { MaxJsonLength = MaximumUiJsonLength, RecursionLimit = 32 };
@@ -41,14 +43,21 @@ namespace NetworkRescue
         private MonitoringSession monitoring;
         private NetworkChangeSnapshot healthyConfiguration;
         private DiagnosticReport healthyReport;
-        internal const string DisplayVersion = "1.0.0";
+        internal const string DisplayVersion = "1.1.0";
         internal sealed class MonitoringSession
         {
             internal readonly object Sync = new object();
+            internal readonly object PersistSync = new object();
+            internal readonly string HistoryId = Guid.NewGuid().ToString("N");
             internal readonly MonitorTarget[] Targets;
             internal readonly Dictionary<string, Queue<MonitorSample>> Samples = new Dictionary<string, Queue<MonitorSample>>(StringComparer.Ordinal);
+            internal readonly List<MonitorSample> ArchiveSamples = new List<MonitorSample>();
             internal readonly NetworkChangeTracker Changes = new NetworkChangeTracker();
             internal DateTime StartedUtc = DateTime.UtcNow, EndedUtc;
+            internal DateTime NextCheckpointUtc;
+            internal string HistoryState = "Running";
+            internal bool HistorySaveFailed;
+            internal int IntervalMs = 1000, RequestedCount = 60;
             internal bool Cancelled, Failed;
             internal MultiMonitorSummary Final;
             internal MonitoringSession(MonitorTarget[] targets)
@@ -64,6 +73,7 @@ namespace NetworkRescue
                     if (!Samples.TryGetValue(sample.TargetId ?? "", out series)) return;
                     series.Enqueue(sample);
                     if (series.Count > 300) series.Dequeue();
+                    if (ArchiveSamples.Count < 14400) ArchiveSamples.Add(sample);
                 }
             }
         }
@@ -98,7 +108,11 @@ namespace NetworkRescue
                     e.Cancel = true;
                     SoftDialog.Show(DialogOwner, U("native.operationActive"), U("native.resultTitle"), MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
-                else if (cancellation != null) cancellation.Cancel();
+                else if (cancellation != null)
+                {
+                    cancellation.Cancel();
+                    if (operation == "monitor" && monitoring != null) SaveMonitoringCheckpoint(monitoring, "Stopped");
+                }
             };
             view.Closed += delegate { closed = true; if (cancellation != null) cancellation.Cancel(); };
         }
@@ -143,12 +157,35 @@ namespace NetworkRescue
                     await RefreshRecovery(); break;
                 case "export": Export(); break;
                 case "history": SendHistory(); break;
+                case "monitorHistory": RequireAdvanced(); SendMonitoringHistory(); break;
+                case "loadMonitoring": RequireAdvanced(); LoadMonitoring(TextValue(message, "id", 32)); break;
+                case "replayMonitoring":
+                    RequireAdvanced();
+                    ReplayMonitoring(TextValue(message, "id", 32), IntValue(message, "sequence", 1, Int32.MaxValue)); break;
+                case "deleteMonitoring":
+                    RequireAdvanced();
+                    if (SoftDialog.Show(DialogOwner, U("monitorHistoryDeleteConfirm"), U("monitorHistoryTitle"), MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+                    {
+                        string deleteId = TextValue(message, "id", 32);
+                        monitoringHistory.Delete(deleteId);
+                        if (selectedMonitoringHistory != null && selectedMonitoringHistory.Id == deleteId) selectedMonitoringHistory = null;
+                        SendMonitoringHistory();
+                    }
+                    break;
+                case "clearMonitoring":
+                    RequireAdvanced();
+                    if (SoftDialog.Show(DialogOwner, U("monitorHistoryClearConfirm"), U("monitorHistoryTitle"), MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+                    { monitoringHistory.Clear(); selectedMonitoringHistory = null; SendMonitoringHistory(); }
+                    break;
                 case "exportHistory": ExportHistory(); break;
                 case "healthProfiles": case "saveHealthProfile": case "compareHealthProfile": case "deleteHealthProfile":
                 case "monitorPlans": case "saveMonitorPlan": case "deleteMonitorPlan":
                     await Workspace(command, message); break;
                 case "exportMonitoring":
                     RequireAdvanced();
+                    string exportId = OptionalText(message, "id", 32);
+                    if (exportId.Length > 0 && (selectedMonitoringHistory == null || selectedMonitoringHistory.Id != exportId)) { Emit("notice", U("monitorHistoryMissing")); break; }
+                    if (selectedMonitoringHistory != null) { SaveRedactedReport(BuildMonitoringRecordText(selectedMonitoringHistory, U)); break; }
                     if (monitoring == null) { Emit("notice", U("native.notReady")); break; }
                     SaveRedactedReport(BuildMonitoringText(monitoring, U)); break;
                 case "checkUpdates":
@@ -163,6 +200,12 @@ namespace NetworkRescue
                 case "openUpdate":
                     if (updateResult == null || updateResult.Status != "UpdateAvailable" || !UpdateService.IsAllowedReleaseUrl(updateResult.Repository, updateResult.ReleaseUrl)) { Emit("notice", U("updateNotConfigured")); return; }
                     Process.Start(new ProcessStartInfo(updateResult.ReleaseUrl) { UseShellExecute = true }); break;
+                case "openPortalLogin":
+                    Uri portalUri;
+                    if (!PortalLogin.TryGetBrowserUri(report, out portalUri)) { Emit("notice", U("portalLoginUnavailable")); break; }
+                    if (SoftDialog.Show(DialogOwner, U("portalLoginConfirm") + Environment.NewLine + portalUri.AbsoluteUri, U("portalLoginTitle"), MessageBoxButtons.OKCancel, MessageBoxIcon.Information) == DialogResult.OK)
+                        Process.Start(new ProcessStartInfo(portalUri.AbsoluteUri) { UseShellExecute = true });
+                    break;
                 case "site":
                     string siteInput = TextValue(message, "target", 2048);
                     SiteTarget siteTarget; string siteError;
@@ -378,11 +421,13 @@ namespace NetworkRescue
 
         private async Task RunMonitoring(MonitorTarget[] targets, int interval, int count, CancellationToken token)
         {
-            MonitoringSession session = new MonitoringSession(targets);
+            MonitoringSession session = new MonitoringSession(targets) { IntervalMs = interval, RequestedCount = count };
             monitoring = session;
+            selectedMonitoringHistory = null;
             long run = generation;
             Emit(new { type = "monitorStarted", targets = targets, startedUtc = session.StartedUtc });
             Emit(new { type = "networkChange", @event = session.Changes.Record("MonitoringStarted", session.StartedUtc) });
+            SaveMonitoringCheckpoint(session, "Running");
             Action<NetworkChangeEvent> publish = delegate(NetworkChangeEvent change) { PostForRun(run, delegate { Emit(new { type = "networkChange", @event = change }); }); };
             using (CancellationTokenSource observe = CancellationTokenSource.CreateLinkedTokenSource(token))
             {
@@ -399,6 +444,13 @@ namespace NetworkRescue
                             Emit(new { type = "monitorSample", sample = sample });
                             foreach (NetworkChangeEvent change in changes) Emit(new { type = "networkChange", @event = change });
                         });
+                        bool checkpoint;
+                        lock (session.Sync)
+                        {
+                            checkpoint = DateTime.UtcNow >= session.NextCheckpointUtc;
+                            if (checkpoint) session.NextCheckpointUtc = DateTime.UtcNow.AddSeconds(15);
+                        }
+                        if (checkpoint) SaveMonitoringCheckpoint(session, "Running");
                     });
                     session.Final = await NetworkMonitor.RunTargetsAsync(targets, interval, count, updates, token);
                     Emit(new { type = "monitorResult", result = session.Final });
@@ -415,11 +467,114 @@ namespace NetworkRescue
                 session.EndedUtc = DateTime.UtcNow;
                 NetworkChangeEvent ended = session.Changes.Record(session.Cancelled || session.Failed ? "MonitoringStopped" : "MonitoringCompleted", session.EndedUtc);
                 Emit(new { type = "networkChange", @event = ended });
+                SaveMonitoringCheckpoint(session, session.Failed ? "Failed" : session.Cancelled ? "Stopped" : "Completed");
                 object[] series;
                 lock (session.Sync) series = targets.Select(delegate(MonitorTarget target) { return (object)new { TargetId = target.Id, samples = session.Samples[target.Id].ToArray() }; }).ToArray();
                 Emit(new { type = "monitorEnded", cancelled = session.Cancelled, failed = session.Failed, totalEvents = session.Changes.TotalEvents, truncated = session.Changes.TotalEvents > NetworkChangeTracker.MaximumEvents, events = session.Changes.RecentEvents, series = series });
+                SendMonitoringHistory();
                 if (failure != null) failure.Throw();
             }
+        }
+
+        internal static MonitoringHistoryRecord CaptureMonitoringRecord(MonitoringSession session, string state)
+        {
+            lock (session.Sync)
+            {
+                int totalEvents;
+                NetworkChangeEvent[] events = session.Changes.Snapshot(out totalEvents);
+                return new MonitoringHistoryRecord { Id = session.HistoryId, StartedUtc = session.StartedUtc,
+                    EndedUtc = session.EndedUtc == default(DateTime) ? DateTime.UtcNow : session.EndedUtc,
+                    State = state, IntervalMs = session.IntervalMs, RequestedCount = session.RequestedCount,
+                    Targets = session.Targets, Samples = session.ArchiveSamples.ToArray(),
+                    Events = events, TotalEvents = totalEvents };
+            }
+        }
+
+        private void SaveMonitoringCheckpoint(MonitoringSession session, string state)
+        {
+            lock (session.PersistSync)
+            {
+                // A late sample may still arrive during cancellation; it must not revive a terminal session.
+                if (state == "Running" && session.HistoryState != "Running") return;
+                session.HistoryState = state;
+                try { monitoringHistory.Save(CaptureMonitoringRecord(session, state)); }
+                catch (Exception ex)
+                {
+                    if (!(ex is IOException) && !(ex is InvalidDataException) && !(ex is UnauthorizedAccessException) && !(ex is System.Security.SecurityException) &&
+                        !(ex is System.Security.Cryptography.CryptographicException) && !(ex is InvalidOperationException) && !(ex is System.Xml.XmlException) && !(ex is ArgumentException) && !(ex is NotSupportedException)) throw;
+                    if (!session.HistorySaveFailed)
+                    {
+                        session.HistorySaveFailed = true;
+                        long current = generation;
+                        PostForRun(current, delegate { Emit("notice", U("monitorHistorySaveError")); });
+                    }
+                }
+            }
+        }
+
+        private void SendMonitoringHistory()
+        {
+            MonitoringHistoryInfo[] entries = monitoringHistory.List();
+            Emit(new { type = "monitorHistory", entries = entries, error = entries.Any(delegate(MonitoringHistoryInfo entry) { return !String.IsNullOrEmpty(entry.ErrorCode); }) ? "MonitoringHistoryUnreadable" : "" });
+        }
+
+        private void LoadMonitoring(string id)
+        {
+            MonitoringHistoryRecord record = monitoringHistory.Load(id);
+            if (record == null) { Emit("notice", U("monitorHistoryMissing")); SendMonitoringHistory(); return; }
+            selectedMonitoringHistory = record;
+            Emit(new { type = "monitorHistoryLoaded", id = record.Id, startedUtc = record.StartedUtc, endedUtc = record.EndedUtc,
+                state = record.State, intervalMs = record.IntervalMs, targets = record.Targets,
+                series = record.Targets.Select(delegate(MonitorTarget target) { MonitorSample[] points = record.Samples.Where(delegate(MonitorSample sample) { return sample.TargetId == target.Id; }).ToArray(); return new { TargetId = target.Id, samples = points.Skip(Math.Max(0, points.Length - 300)).ToArray() }; }).ToArray(),
+                events = record.Events, totalEvents = record.TotalEvents, truncated = record.EventsTruncated });
+        }
+
+        internal static object BuildMonitoringReplay(MonitoringHistoryRecord record, int sequence)
+        {
+            NetworkChangeEvent selected = record.Events.FirstOrDefault(delegate(NetworkChangeEvent change) { return change.Sequence == sequence; });
+            if (selected == null) throw new InvalidDataException("MonitoringHistoryEventMissing");
+            double seconds = selected.Kind == "SettingChanged" ? 10 : Math.Max(2, record.IntervalMs / 1000.0);
+            long? duration = null; bool recovered = false;
+            if (selected.Kind == "TargetNoResponse")
+            {
+                NetworkChangeEvent recovery = record.Events.FirstOrDefault(delegate(NetworkChangeEvent change) { return change.Kind == "TargetRecovered" && change.TargetId == selected.TargetId && change.TimeUtc >= selected.TimeUtc; });
+                recovered = recovery != null;
+                duration = Math.Max(0, (long)((recovery == null ? record.EndedUtc : recovery.TimeUtc) - selected.TimeUtc).TotalMilliseconds);
+            }
+            return new { type = "monitorHistoryReplay", id = record.Id, sequence = sequence, durationMs = duration, recovered = recovered,
+                series = record.Targets.Select(delegate(MonitorTarget target) { return new { TargetId = target.Id,
+                    samples = record.Samples.Where(delegate(MonitorSample sample) { return sample.TargetId == target.Id && Math.Abs((sample.TimeUtc - selected.TimeUtc).TotalSeconds) <= seconds; }).ToArray() }; }).ToArray() };
+        }
+
+        private void ReplayMonitoring(string id, int sequence)
+        {
+            if (selectedMonitoringHistory == null || selectedMonitoringHistory.Id != id) throw new InvalidDataException("MonitoringHistoryNotSelected");
+            Emit(BuildMonitoringReplay(selectedMonitoringHistory, sequence));
+        }
+
+        internal static string BuildMonitoringRecordText(MonitoringHistoryRecord record, Func<string, string> text)
+        {
+            StringBuilder output = new StringBuilder();
+            output.AppendLine(text("redactionNotice"));
+            output.AppendLine(text("brand") + " " + DisplayVersion + " · " + text("monitorHistoryTitle"));
+            output.AppendLine(record.StartedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") + " → " + record.EndedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"));
+            output.AppendLine(text("monitorHistoryState" + record.State));
+            output.AppendLine(text("monitorHistoryPrivacy"));
+            foreach (MonitorTarget target in record.Targets)
+            {
+                output.AppendLine();
+                output.AppendLine(target.Id + " · " + target.Host + " · " + target.Method + " · " + text(target.Method == "icmp" ? "monitorIcmp" : target.UseSystemProxy ? "monitorProxyFollow" : "monitorProxyDirect"));
+                foreach (MonitorSample sample in record.Samples.Where(delegate(MonitorSample point) { return point.TargetId == target.Id; }))
+                    output.AppendLine(sample.TimeUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss.fff") + " · " + sample.Sequence + " · " + sample.Status + " · " + (sample.RttMs.HasValue ? sample.RttMs.Value.ToString(System.Globalization.CultureInfo.InvariantCulture) : "—") + " ms · HTTP " + sample.HttpStatusCode + " · " + sample.ErrorCode);
+            }
+            output.AppendLine(text("monitorTimelineTitle") + " · " + record.Events.Length + "/" + record.TotalEvents);
+            if (record.EventsTruncated) output.AppendLine(text("monitorTimelineTruncated"));
+            foreach (NetworkChangeEvent change in record.Events)
+            {
+                output.AppendLine(change.TimeUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss.fff") + " · " + text("monitorEvent" + change.Kind) + " · " + change.TargetHost + " · " + change.AdapterName + " · " + text("monitorSetting" + change.Setting));
+                if (change.Kind == "SettingChanged") output.AppendLine(change.Before + " → " + change.After);
+            }
+            return output.ToString();
         }
 
         internal static async Task ObserveConfigurationAsync(MonitoringSession session, Action<NetworkChangeEvent> publish, CancellationToken token, Func<NetworkChangeSnapshot> capture)
@@ -836,7 +991,11 @@ namespace NetworkRescue
         private void SendInit() { Emit(new { type = "init", language = I18n.Language, mode = mode, theme = theme, version = DisplayVersion, updateRepository = updateRepository, monitorGateway = NetworkChangeReader.FindGateway(), canSaveHealthProfile = CanSaveHealthProfile }); }
         private void SendReport()
         {
-            Emit(new { type = "report", report = new { Timestamp = report.Timestamp.ToString("o"), Items = report.Items, Summary = report.Summary, InternetAvailable = report.InternetAvailable, Fault = report.Fault, SpecialChecks = report.SpecialChecks }, canSaveHealthProfile = CanSaveHealthProfile });
+            PortalLoginInfo portal = PortalLogin.Inspect(report);
+            Uri portalUri;
+            bool canOpenPortal = PortalLogin.TryGetBrowserUri(report, out portalUri);
+            Emit(new { type = "report", report = new { Timestamp = report.Timestamp.ToString("o"), Items = report.Items, Summary = report.Summary, InternetAvailable = report.InternetAvailable, Fault = report.Fault, SpecialChecks = report.SpecialChecks },
+                portalLogin = new { Suspected = portal.Suspected, Url = canOpenPortal ? portalUri.AbsoluteUri : "", DisplayOrigin = portal.DisplayOrigin, IsTriggerPage = portal.IsTriggerPage }, canSaveHealthProfile = CanSaveHealthProfile });
         }
         private void Emit(string type, string text) { Emit(new { type = type, text = text }); }
         private void Emit(object value)

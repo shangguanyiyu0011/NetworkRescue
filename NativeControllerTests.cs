@@ -31,6 +31,8 @@ namespace NetworkRescue
                 MonitorCommandChecks();
                 MultiMonitorBridgeChecks();
                 MonitoringRetentionChecks();
+                MonitoringHistoryBridgeChecks();
+                MonitoringPersistenceFailureChecks();
                 MonitoringCaptureCancellationChecks();
                 SiteCommandChecks();
                 UpdateCommandChecks();
@@ -266,7 +268,7 @@ namespace NetworkRescue
             Check(typeof(NativeController).GetField("operation", flags).GetValue(controller) == null && !Directory.Exists(guardedRoot), "Automatic save retains the complete configuration gate");
             ((Task)typeof(NativeController).GetMethod("Dispatch", flags).Invoke(controller, new object[] { new Dictionary<string, object> { { "command", "saveHealthProfile" }, { "autoName", false }, { "name", "Manual fixture" } } })).GetAwaiter().GetResult();
             Check(typeof(NativeController).GetField("operation", flags).GetValue(controller) == null && !Directory.Exists(guardedRoot), "Explicit false with a valid manual name follows the original healthy report gate");
-            Check(NativeController.DisplayVersion == "1.0.0", "Controller display version matches 1.0.0");
+            Check(NativeController.DisplayVersion == "1.1.0", "Controller display version matches 1.1.0");
         }
 
         private static void HealthComparisonBudgetChecks()
@@ -392,6 +394,70 @@ namespace NetworkRescue
             Check(!redacted.Contains("target4.example.test") && redacted.Contains("断网急救箱"), "Monitoring report preserves the renamed brand and redacts target hostnames");
             Check(redacted.Contains(" · 330 · "), "Redacted monitoring reports retain sample sequence numbers without URL fragment markers");
         }
+        private static void MonitoringHistoryBridgeChecks()
+        {
+            var target = new MonitorTarget { Id = "history-target", Host = "example.test", Method = "https", UseSystemProxy = false };
+            var session = new NativeController.MonitoringSession(new[] { target }) { StartedUtc = DateTime.UtcNow.AddMinutes(-20), RequestedCount = 600 };
+            session.Changes.Record("MonitoringStarted", session.StartedUtc);
+            for (int i = 1; i <= 600; i++)
+            {
+                bool success = i != 5;
+                var sample = new MonitorSample { TargetId = target.Id, TargetHost = target.Host, Sequence = i, Sent = i, Received = i - (i >= 5 ? 1 : 0),
+                    TimeUtc = session.StartedUtc.AddSeconds(i), Success = success, ResponseReceived = success, HttpSuccess = success,
+                    HttpStatusCode = success ? (int?)200 : null, Method = "HTTPS", Route = "Direct", Status = success ? "Success" : "TimedOut", RttMs = success ? (long?)3 : null };
+                session.Append(sample); session.Changes.ObserveSample(sample);
+            }
+            MonitoringHistoryRecord record = NativeController.CaptureMonitoringRecord(session, "Running");
+            Check(record.Samples.Length == 600 && session.Samples[target.Id].Count == 300, "Persistent archive preserves early samples beyond the live chart window");
+            Check(record.Events.Length == record.TotalEvents && record.EndedUtc >= record.Samples.Last().TimeUtc, "Checkpoint atomically captures event total and a timestamp covering its samples");
+            NetworkChangeEvent outage = record.Events.Single(delegate(NetworkChangeEvent change) { return change.Kind == "TargetNoResponse"; });
+            var serializer = new System.Web.Script.Serialization.JavaScriptSerializer();
+            Dictionary<string, object> replay = serializer.Deserialize<Dictionary<string, object>>(serializer.Serialize(NativeController.BuildMonitoringReplay(record, outage.Sequence)));
+            Dictionary<string, object> first = ((System.Collections.IEnumerable)replay["series"]).Cast<Dictionary<string, object>>().First();
+            Dictionary<string, object>[] points = ((System.Collections.IEnumerable)first["samples"]).Cast<Dictionary<string, object>>().ToArray();
+            Check(points.Length > 0 && points.Any(delegate(Dictionary<string, object> point) { return (int)point["Sequence"] == 5; }), "History replay retrieves an actual early outage point outside the live 300-point cache");
+            Check((bool)replay["recovered"] && Convert.ToInt64(replay["durationMs"]) == 1000, "History non-response duration uses observed recovery time");
+            string exported = NativeController.BuildMonitoringRecordText(record, delegate(string key) { return key; });
+            Check(exported.Contains(" · 5 · ") && exported.Contains(" · 600 · ") && exported.Contains("monitorEventTargetNoResponse"), "Historical export includes early and recent real samples with the event timeline");
+            bool rejected = false;
+            try { NativeController.BuildMonitoringReplay(record, Int32.MaxValue); } catch (InvalidDataException) { rejected = true; }
+            Check(rejected, "Replay rejects a missing event instead of manufacturing an observation");
+        }
+
+        private static void MonitoringPersistenceFailureChecks()
+        {
+            BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
+            string directory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "monitor-save-fixture-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(directory);
+            string blocked = Path.Combine(directory, "blocked");
+            File.WriteAllText(blocked, "keep");
+            try
+            {
+                NativeController controller = UninitializedController();
+                FieldInfo store = typeof(NativeController).GetField("monitoringHistory", flags);
+                MethodInfo checkpoint = typeof(NativeController).GetMethod("SaveMonitoringCheckpoint", flags);
+                store.SetValue(controller, new MonitoringHistoryStore(blocked));
+                var target = new MonitorTarget { Id = "safe", Host = "example.test", Method = "https" };
+                var session = new NativeController.MonitoringSession(new[] { target });
+                checkpoint.Invoke(controller, new object[] { session, "Running" });
+                Check(session.HistorySaveFailed && File.ReadAllText(blocked) == "keep", "Unavailable history path degrades without touching existing files or the absent closed view");
+                checkpoint.Invoke(controller, new object[] { session, "Stopped" });
+                checkpoint.Invoke(controller, new object[] { session, "Running" });
+                Check(session.HistoryState == "Stopped", "Late checkpoint cannot revive a terminal session even when storage failed");
+                session = new NativeController.MonitoringSession(new[] { target });
+                string corrupted = Path.Combine(directory, session.HistoryId + ".nrh");
+                File.WriteAllText(corrupted, "corrupt-preserve");
+                store.SetValue(controller, new MonitoringHistoryStore(directory));
+                try
+                {
+                    checkpoint.Invoke(controller, new object[] { session, "Running" });
+                    Check(session.HistorySaveFailed && File.ReadAllText(corrupted) == "corrupt-preserve", "Unreadable checkpoint is preserved and cannot abort monitoring or normal close");
+                }
+                finally { File.Delete(corrupted); }
+            }
+            finally { File.Delete(blocked); Directory.Delete(directory); }
+        }
+
         private static void MonitoringCaptureCancellationChecks()
         {
             var session = new NativeController.MonitoringSession(new[] { new MonitorTarget { Id = "a", Host = "127.0.0.1", Method = "icmp" } });

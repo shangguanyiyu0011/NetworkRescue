@@ -1,0 +1,97 @@
+name: Build, test and release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: [x64, x86]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build and run all checks
+        shell: powershell
+        run: .\build.ps1 -Architecture ${{ matrix.architecture }}
+      - name: Package verified build
+        shell: powershell
+        run: |
+          .\publish.ps1 -Architecture ${{ matrix.architecture }} -SkipBuild
+          $taskPackage = Get-Item -LiteralPath ('dist/NetworkRescue-v1.1.0-win-${{ matrix.architecture }}.zip')
+          $taskChecksum = (Get-FileHash -LiteralPath $taskPackage.FullName -Algorithm SHA256).Hash.ToLowerInvariant() + '  ' + $taskPackage.Name
+          [IO.File]::WriteAllText((Join-Path $taskPackage.DirectoryName 'SHA256SUMS-${{ matrix.architecture }}.txt'), $taskChecksum + "`n", [Text.Encoding]::ASCII)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package-${{ matrix.architecture }}
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS-*.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'Release 1.1.0:')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: package-*
+          merge-multiple: true
+          path: packages
+      - name: Verify and publish 1.1.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fq 'AssemblyInformationalVersion("1.1.0")' Program.cs
+          test -f packages/NetworkRescue-v1.1.0-win-x64.zip
+          test -f packages/NetworkRescue-v1.1.0-win-x86.zip
+          cat packages/SHA256SUMS-x64.txt packages/SHA256SUMS-x86.txt > packages/SHA256SUMS.txt
+          (cd packages && sha256sum --check SHA256SUMS.txt)
+          if gh release view v1.1.0 >/dev/null 2>&1; then
+            echo 'Release v1.1.0 already exists; existing assets are never overwritten.'
+            exit 0
+          fi
+          set +e
+          git ls-remote --exit-code --tags origin refs/tags/v1.1.0 >/dev/null 2>&1
+          task_tag_status=$?
+          set -e
+          if [ "$task_tag_status" -eq 0 ]; then
+            echo 'Tag v1.1.0 already exists without a release; refusing to attach new binaries to an unverified source tag.' >&2
+            exit 1
+          fi
+          if [ "$task_tag_status" -ne 2 ]; then
+            echo 'Tag lookup failed; refusing to publish without a verified source tag state.' >&2
+            exit 1
+          fi
+          gh release create v1.1.0 \
+            packages/NetworkRescue-v1.1.0-win-x64.zip \
+            packages/NetworkRescue-v1.1.0-win-x86.zip \
+            packages/SHA256SUMS.txt \
+            --target "$GITHUB_SHA" \
+            --title 'NetworkRescue 1.1.0 · 断网追踪与定位增强' \
+            --notes-file docs/RELEASE-NOTES.v1.1.md

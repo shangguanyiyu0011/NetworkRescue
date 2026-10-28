@@ -3,6 +3,7 @@
 /build-x86/
 /build-native-x64/
 /build-native-x86/
+/build-history-checks/
 /packages/
 /dist/
 /.vs/

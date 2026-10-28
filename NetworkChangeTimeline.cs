@@ -177,6 +177,10 @@ namespace NetworkRescue
 
         public int TotalEvents { get { lock (gate) return totalEvents; } }
         public NetworkChangeEvent[] RecentEvents { get { lock (gate) return events.Select(Clone).ToArray(); } }
+        public NetworkChangeEvent[] Snapshot(out int total)
+        {
+            lock (gate) { total = totalEvents; return events.Select(Clone).ToArray(); }
+        }
 
         private static NetworkChangeEvent Clone(NetworkChangeEvent value)
         {

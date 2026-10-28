@@ -1,8 +1,8 @@
-断网急救箱 Network Rescue 1.0.0 使用说明
-开发与维护：上官一羽。自有代码 GPL-3.0-only，见包内 LICENSE；对应源码：https://github.com/shangguanyiyu0011/NetworkRescue/tree/v1.0.0
+断网急救箱 Network Rescue 1.1.0 使用说明
+开发与维护：上官一羽。自有代码 GPL-3.0-only，见包内 LICENSE；对应源码：https://github.com/shangguanyiyu0011/NetworkRescue/tree/v1.1.0
 
 运行与下载
-从官方仓库的 v1.0.0 Release 获取 win-x64 或 win-x86 ZIP，完整解压到可写本地目录后打开 NetworkRescue.exe，保留语言、图标和说明文件。
+从官方仓库 https://github.com/shangguanyiyu0011/NetworkRescue/releases/tag/v1.1.0 获取 NetworkRescue-v1.1.0-win-x64.zip 或 NetworkRescue-v1.1.0-win-x86.zip，完整解压到可写本地目录后打开 NetworkRescue.exe，保留语言、图标和说明文件。
 基线：Windows 10 22H2 x86/x64、Windows 11 x64，系统 .NET Framework 4.8 或更高。Windows 11 无 x86 版；纯 32 位 OS 未实测。无需另装 WebView2、.NET SDK、Node.js 或 Python。正式 EXE 未作应用数字签名。
 旧 NetworkRescue 标识及 %LOCALAPPDATA%\NetworkRescue\ 路径保持兼容，不会因中文改名迁移/清空设置或备份。
 
@@ -30,20 +30,23 @@ VPN/Wi-Fi 专项只读 PAC/WPAD、WinHTTP、DNS、路由、虚拟网卡与当前
 高级模式可看分组证据和折叠原始日志，当前项修复与下方批量选择独立。
 Ping、DNS、Trace、TCP 使用真实样本；目标域名/IP，TCP 端口 1–65535。DNS 对比向 1–4 个显式服务器查询 A/AAAA，UDP 有界、截断回退 TCP，不改系统 DNS；地域/CDN/缓存差异不是污染证据。
 网卡卡片是刷新快照。活动 TCP 关联 PID/程序名，可搜索地址、端口、PID、名称并按状态筛选，仅覆盖最多 512 条已读取行。进程信息为非原子快照，可能退出、不可读或 PID 复用，不提权、不结束程序。
-网站排查可输入域名或 HTTP(S) 网址，只请求显示的 origin 根路径，丢弃路径/query/fragment，拒绝凭据及非法端口。IPv6 跳过不是 0 ms，IPv4 可达而 IPv6 不可达不独断整机故障。
+网站排查可输入域名或 HTTP(S) 网址，只请求显示的 origin 根路径，丢弃路径/query/fragment，拒绝凭据及非法端口。分别强制 IPv4/IPv6 HTTP(S) 验证，每族最多尝试 2 个已解析地址，共限时 3 秒，保留原域名和默认 TLS 验证、绕过系统 HTTP 代理。无 AAAA 时 IPv6 不适用，不是 0 ms；局部未确认不证明整个协议不可用，不自动禁用协议。
+疑似网络门户仅提供手动入口：确认后在系统浏览器打开 Windows 网络认证触发页，网络可能重定向。它不是已确认的实际门户，不自动登录、不提交凭据。完成认证后点击重新诊断。
 
 持续监测与常用设置
 1. 输入 1–4 个域名/IP（不填 URL 路径），分别选 HTTPS/ICMP 与 HTTPS 系统代理/忽略代理路径。
 2. 设置统一目标间隔 1–10 秒及每目标最多 3,600 次；全部目标验证后才发包，请求耗时会拉长实际间隔。
-3. 开始后各目标独立统计，各曲线保留最近 300 点；可停止，已有观测保留。编辑输入不改变旧会话图表，下一次确认开始才替换。
+3. 开始后各目标独立统计，最多保存每目标 3600 个真实样本，各曲线显示最近 300 点；可停止，已有观测保留。编辑输入不改变旧会话图表，下一次确认开始才替换。
 4. 可展开默认收起的“常用监测设置（可选）”保存上方完整参数，最多 20 方案；下次选择只填参数，再自行开始，不会自动发包。
 “添加网关”只使用已读取的配置网关，不证明当前有效路由。ICMP 不跟随 HTTP 代理，忽略代理不等于绕过 VPN。
 HTTPS 只读头，TLS 校验、3 秒取消、32 KiB 头部上限，不跟随跳转、不发默认/代理凭据。任何状态都代表应答，不等于网页可用；407 提示代理认证，耗时含 DNS/TLS/代理。
 
 变化时间线与异常回放
 运行中约每 2 秒只读采集去秘密后的代理/PAC、DNS/IP、配置网关及网卡状态，并记录目标无回应/恢复。读取失败或不完整不当删除，变化不证明因果。
-时间线仅内存保留最近 500 事件并显示完整总数/截断。长值最多三行，tooltip/复制保留完整值；停止后可先脱敏预览，再选本地保存位置。
-选择事件联动真实缓存：目标事件前后一个采样间隔（至少 2 秒）取最近实际点，配置变化前后 10 秒，并显示同时间其他目标。超出最近 300 点/目标缓存时明确缺失，不补造点、不持久化监控采样，不后台驻留。
+时间线最多保留最近 500 事件并显示完整总数/截断。长值最多三行，tooltip/复制保留完整值；停止后可先脱敏预览，再选本地保存位置。
+选择事件联动真实缓存：目标事件前后一个采样间隔（至少 2 秒）取最近实际点，配置变化前后 10 秒，并显示同时间其他目标。没有真实样本时明确缺失，不补造点；曲线只显示最近 300 点，但历史最多保留每目标 3600 个真实样本。
+手动开始后自动使用当前用户 DPAPI 本地加密保存，每 15 秒及结束/关闭时保存；最多 20 条且总计 64 MiB，不上传、不后台驻留。监测历史可刷新、载入跨启动回放、删除所选或清空；载入不发起网络检测。删除/清空需确认，损坏记录不覆盖不删除，清空只删除可读记录。
+Interrupted 表示意外中断，仅恢复最后保存的检查点，最多 15 秒样本可能未保存。加密不等于匿名化，IP/域名仍需在分享前检查。
 
 健康快照
 1. 完成最近 5 分钟内成功的联网诊断；保存前配置须仍相同且读取完整，否则重新诊断。
@@ -73,6 +76,7 @@ HTTPS 只读头，TLS 校验、3 秒取消、32 KiB 头部上限，不跟随跳�
 历史：%LOCALAPPDATA%\NetworkRescue\History\history.nrh
 健康快照：%LOCALAPPDATA%\NetworkRescue\Workspace\health-profiles.nrw
 监测方案：%LOCALAPPDATA%\NetworkRescue\Workspace\monitor-plans.nrw
+监测历史：%LOCALAPPDATA%\NetworkRescue\Monitoring\（当前用户 DPAPI、最多 20 条、总计 64 MiB）
 工作区两文件各 DPAPI CurrentUser/schema 1/最多 20 项/1 MiB，原子写、损坏不覆盖；可跨启动读取，不是跨账户/机器通用导入格式。敏感 IP/域名仍须脱敏，本机资料不进入源码或运行包。
-构建：.\build.ps1 -Architecture x64（或 x86）；打包：.\publish.ps1 -Architecture x64（或 x86）。完整验证范围、正式 EXE 哈希和历史版本边界见 docs/RELEASE-READINESS.v1.md。
-1.0.0 产品版本为 1.0.0，程序集/文件版本 1.0.0.0；只修改默认更新仓库、空配置迁移和相关提示，不改诊断/修复逻辑。最新测试计数/哈希待本版冻结填写，旧版测试不转作本版新结果；历史记录保持。
+构建：.\build.ps1 -Architecture x64（或 x86）；打包：.\publish.ps1 -Architecture x64（或 x86）。完整验证范围、正式 EXE 哈希和历史版本边界见 docs/RELEASE-READINESS.v1.1.md。
+1.1.0 产品版本为 1.1.0，程序集/文件版本 1.1.0.0；新增监测持久化与跨启动回放、分地址族 HTTP(S) 验证和疑似门户手动入口，四种修复范围不变。18 套检查及实际包/实窗结果以本版验证记录为准。旧 1.0.0 测试计数与截图不转作本版结果；历史记录保留于 docs/RELEASE-READINESS.v1.md。

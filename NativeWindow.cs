@@ -88,6 +88,11 @@ namespace NetworkRescue
         private readonly List<MonitorRow> monitorSessionTargets = new List<MonitorRow>();
         private int monitorSessionIntervalMs = 1000;
         private bool monitorTimelineUpdating;
+        private object[] monitorHistory = new object[0];
+        private string monitorHistoryError = "", selectedMonitorHistory = "", loadedMonitorHistory = "", pendingMonitorHistory = "";
+        private bool monitorHistoryRequested;
+        private Dictionary<string, object> portalLogin, historyReplay;
+        private readonly Dictionary<string, List<Dictionary<string, object>>> historyReplaySamples = new Dictionary<string, List<Dictionary<string, object>>>();
 
         public NativeWindow()
         {
@@ -136,6 +141,7 @@ namespace NetworkRescue
                 case "busy": string nextBusy = Empty(S(data, "operation")); if (busy != nextBusy) { cancelled = false; if (nextBusy != null) { ClearNotice(); if (nextBusy == "speed") ResetSpeed(); } } busy = nextBusy; UpdateLocks(); if (page == "diagnosis") RenderPage(); RequestPageProfiles(); return;
                 case "progress": footer.Text = S(data, "text"); return;
                 case "report":
+                    portalLogin = D(V(data, "portalLogin")) ?? D(V(D(V(data, "report")), "PortalLogin"));
                     report = D(V(data, "report")); chosen.Clear(); beginnerChosen.Clear(); currentChosen.Clear(); specialChosen.Clear(); if (report != null) ClearNotice();
                     if (data.ContainsKey("canSaveHealthProfile")) healthCanSave = B(data, "canSaveHealthProfile");
                     DateTime reportUtc; if (TryUtc(V(report, "Timestamp"), out reportUtc)) healthEligibleUntilUtc = reportUtc.AddMinutes(5);
@@ -154,6 +160,20 @@ namespace NetworkRescue
                 case "monitorPlans": SaveInputs(); monitorPlans = A(V(data, "plans")); if (!monitorPlans.Select(D).Any(delegate(Dictionary<string, object> plan) { return S(plan, "Id") == selectedMonitorPlan; })) selectedMonitorPlan = ""; if (pendingMonitorPlanName.Length > 0) { Dictionary<string, object> saved = monitorPlans.Select(D).FirstOrDefault(delegate(Dictionary<string, object> plan) { return S(plan, "Name") == pendingMonitorPlanName; }); if (saved != null) { selectedMonitorPlan = S(saved, "Id"); Notice(String.Format(U("monitorPlanSaved"), pendingMonitorPlanName), false); } pendingMonitorPlanName = ""; } if (page == "monitor") RenderPage(); break;
                 case "healthProfileSaved": Notice(String.Format(U("healthSnapshotSaved"), S(D(V(data, "profile")), "Name")), false); break;
                 case "monitorStarted": ApplyMonitorStarted(data); break;
+                case "monitorHistory":
+                    SaveInputs(); monitorHistory = A(V(data, "entries")).Take(20).ToArray(); monitorHistoryError = S(data, "error");
+                    if (monitorHistoryError.Length == 0 && loadedMonitorHistory.Length > 0 && !monitorHistory.Select(D).Any(delegate(Dictionary<string, object> entry) { return S(entry, "Id") == loadedMonitorHistory; })) { ClearMonitorHistorySelection(); monitorSessionTargets.Clear(); monitorEvents.Clear(); monitorEventRows.Clear(); samples.Clear(); monitor = null; monitorEventTotal = 0; monitorEventTruncated = false; monitorFailed = false; }
+                    if (!monitorHistory.Select(D).Any(delegate(Dictionary<string, object> entry) { return S(entry, "Id") == selectedMonitorHistory; })) selectedMonitorHistory = "";
+                    if (page == "monitor") RenderPage(); break;
+                case "monitorHistoryLoaded": ApplyMonitorHistory(data); break;
+                case "monitorHistoryReplay":
+                    if (busy == null && loadedMonitorHistory.Length > 0 && S(data, "id") == loadedMonitorHistory && selectedMonitorEvent != null && N(data, "sequence") == N(selectedMonitorEvent, "Sequence"))
+                    {
+                        historyReplay = data; historyReplaySamples.Clear();
+                        foreach (object item in A(V(data, "series"))) { Dictionary<string, object> series = D(item); string id = S(series, "TargetId"); if (id.Length > 0) historyReplaySamples[id] = A(V(series, "samples")).Select(D).Where(delegate(Dictionary<string, object> sample) { return sample != null && (S(sample, "TargetId").Length == 0 || S(sample, "TargetId") == id); }).ToList(); }
+                        RenderMonitorReplay(); RefreshMonitorCards();
+                    }
+                    break;
                 case "monitorSample": RecordMonitorSample(D(V(data, "sample"))); break;
                 case "monitorResult": ApplyMonitorResult(D(V(data, "result"))); break;
                 case "networkChange": RecordMonitorEvent(D(V(data, "event"))); break;
@@ -177,6 +197,7 @@ namespace NetworkRescue
         private void ClearDynamic()
         {
             report = speed = site = comparison = updateResult = advancedResult = null; advancedSamples.Clear(); ResetSpeed(); dnsResults.Clear(); siteProbes.Clear();
+            portalLogin = null;
             history = operationDetails = new object[0]; adapterRows = null; adapterTimestamp = ""; chosen.Clear(); beginnerChosen.Clear(); currentChosen.Clear(); specialChosen.Clear();
             advancedOutput = adaptersOutput = connectionsOutput = ""; noticeText = null; historyError = null;
         }
@@ -278,7 +299,7 @@ namespace NetworkRescue
             AutomationProperties.SetAutomationId(button, "nav-" + target); AutomationProperties.SetName(button, T(key)); button.Click += delegate { Navigate(target); }; return button;
         }
         private void Navigate(string target) { SaveInputs(); ClearNotice(); page = target; RenderNavigation(); RenderPage(); bodyScroll.ScrollToTop(); RequestPageProfiles(); }
-        private void RequestPageProfiles() { if (busy != null) return; if (page == "settings" && !healthProfilesRequested) { healthProfilesRequested = true; Request("healthProfiles", null); } if (page == "monitor" && !monitorPlansRequested) { monitorPlansRequested = true; Request("monitorPlans", null); } }
+        private void RequestPageProfiles() { if (busy != null) return; if (page == "settings" && !healthProfilesRequested) { healthProfilesRequested = true; Request("healthProfiles", null); } if (page == "monitor" && !monitorPlansRequested) { monitorPlansRequested = true; Request("monitorPlans", null); } if (page == "monitor" && !monitorHistoryRequested) { monitorHistoryRequested = true; Request("monitorHistory", null); } }
         private void RenderPage()
         {
             if (inputPage == page) SaveInputs();
@@ -336,7 +357,7 @@ namespace NetworkRescue
         private void Start(string command, Dictionary<string, object> values)
         {
             if (busy != null) return; SaveInputs(); noticeText = null; RenderNotice();
-            if (command == "diagnose") { report = null; chosen.Clear(); beginnerChosen.Clear(); currentChosen.Clear(); specialChosen.Clear(); }
+            if (command == "diagnose") { report = null; portalLogin = null; chosen.Clear(); beginnerChosen.Clear(); currentChosen.Clear(); specialChosen.Clear(); }
             if (command == "speed") ResetSpeed();
             busy = command; cancelled = false; footer.Text = T("working"); UpdateLocks(); if (page == "diagnosis") RenderPage(); Request(command, values);
         }
@@ -347,9 +368,18 @@ namespace NetworkRescue
             WrapPanel top = new WrapPanel(); top.Children.Add(MakeStartButton(report == null ? "startScan" : "scanAgain", "diagnose", delegate { Start("diagnose", null); })); top.Children.Add(MakeButton("exportReport", delegate { Request("export", null); }, false, true, delegate { return report != null; })); if (mode == "advanced") top.Children.Add(MakeButton("restoreConfig", delegate { Start("restore", null); })); banner.Children.Add(top);
             if (B(report, "InternetAvailable")) top.Children.Add(SmallButton("healthProfileSaveEntry", delegate { Request("saveHealthProfile", Values("autoName", true)); }, CanSaveHealthProfile));
             if (report != null) banner.Children.Add(Text(T("lastScan") + "  " + DateText(V(report, "Timestamp")), 12, Muted));
+            RenderPortalLogin();
             if (mode == "advanced") { RenderWorkbench(); RenderInsights(); RenderRepairs(); }
             else { RenderBeginnerChecks(); RenderRepairs(); RenderInsights(); }
             RenderComparisons(body);
+        }
+        private void RenderPortalLogin()
+        {
+            if (report == null || !B(portalLogin, "Suspected")) return;
+            StackPanel card = Card(body, U("portalLoginTitle"), U("portalLoginHint")); AutomationProperties.SetAutomationId(card, "portal-login-card");
+            card.Children.Add(Text("http://www.msftconnecttest.com/redirect", 12, Muted));
+            WrapPanel actions = new WrapPanel(); actions.Children.Add(SmallButton("portalLoginOpen", delegate { Request("openPortalLogin", null); }));
+            actions.Children.Add(SmallButton("portalLoginRetest", delegate { Start("diagnose", null); })); card.Children.Add(actions);
         }
         private void RenderBeginnerChecks()
         {
@@ -601,24 +631,27 @@ namespace NetworkRescue
             if (results == null) return; results.Children.Clear();
             StackPanel summary = Card(results, T(site == null ? "siteWaiting" : "site" + S(site, "ConclusionCode")), T("siteLimit")); Dictionary<string, object> target = D(V(site, "Target")); if (target != null) summary.Children.Add(Text(T("siteTarget") + " · " + S(target, "Origin"), 12, Muted));
             IEnumerable<Dictionary<string, object>> probes = site == null ? siteProbes : A(V(site, "Probes")).Select(D).Where(delegate(Dictionary<string, object> p) { return p != null; });
-            foreach (string kind in new[] { "SystemDns", "TcpV4", "TcpV6", "HttpDirect", "HttpWindowsProxy" })
+            foreach (string kind in new[] { "SystemDns", "TcpV4", "TcpV6", "HttpV4", "HttpV6", "HttpDirect", "HttpWindowsProxy" })
             {
                 Dictionary<string, object> probe = probes.FirstOrDefault(delegate(Dictionary<string, object> p) { return S(p, "Kind") == kind; }); if (probe == null) continue;
-                bool http = kind == "HttpDirect" || kind == "HttpWindowsProxy", skipped = (kind == "TcpV4" || kind == "TcpV6") && S(probe, "Status") == "NoAddress";
+                bool family = kind == "HttpV4" || kind == "HttpV6", http = family || kind == "HttpDirect" || kind == "HttpWindowsProxy", skipped = S(probe, "Status") == "NotApplicable" || (kind == "TcpV4" || kind == "TcpV6") && S(probe, "Status") == "NoAddress";
                 int code = (int)N(probe, "HttpStatusCode");
                 string status = B(probe, "ResponseReceived") ? "siteResponded" : B(probe, "Connected") ? "siteConnected" : B(probe, "DnsResolved") ? "siteResolved" : S(probe, "Status") == "NoAddress" ? "siteNoAddress" : "siteNoResponse";
                 string explanation = skipped && kind == "TcpV6" ? "siteNoIpv6Explanation" : status;
                 if (http && B(probe, "ResponseReceived")) explanation = code == 407 ? "siteProxyAuthenticationRequired" : code == 401 || code == 403 ? "siteHttpAccessRestricted" : code >= 500 ? "siteHttpServerErrorReceived" : code >= 400 ? "siteHttpClientErrorReceived" : code >= 300 ? "siteRedirectExplanation" : code >= 200 ? "siteHttpOkExplanation" : "siteHttpResponseReceived";
                 else if (http && (S(probe, "ErrorCode") == "HttpTrustFailure" || S(probe, "ErrorCode") == "HttpSecureChannelFailure")) explanation = "siteTlsValidationOrHandshakeFailed";
+                if (family && !B(probe, "ResponseReceived")) explanation = skipped ? "siteFamilyNoAddress" : S(probe, "ErrorCode") == "SiteDnsUnconfirmed" ? "siteFamilyDnsUnconfirmed" : S(probe, "ErrorCode") == "SiteTlsValidationOrHandshakeFailed" ? "siteTlsValidationOrHandshakeFailed" : "siteFamilyNoResponse";
                 StackPanel card = Card(results, T("site" + kind), T(explanation)); AutomationProperties.SetAutomationId(card, "site-probe-" + kind);
                 if (http && code > 0) { card.Children.Add(Text(T("siteResponseCode"), 11, Muted)); card.Children.Add(SmallBadge("HTTP " + code.ToString(CultureInfo.InvariantCulture), code >= 200 && code < 300 ? "#28694C" : "#865A18", code >= 200 && code < 300 ? "#E2EEE6" : "#F3E8CF")); }
-                if (http) card.Children.Add(Text(T(kind == "HttpDirect" ? "siteDirectExplanation" : "siteProxyExplanation"), 12, Muted));
+                if (http) card.Children.Add(Text(T(family ? "siteFamilyExplanation" : kind == "HttpDirect" ? "siteDirectExplanation" : "siteProxyExplanation"), 12, Muted));
+                if (family && !skipped && V(probe, "AddressCount") != null) card.Children.Add(EvidenceField(U("siteFamilyAddresses"), S(probe, "AttemptedAddressCount") + " / " + S(probe, "AddressCount")));
                 if (skipped) card.Children.Add(SmallBadge(T("siteNotMeasured"), "#62616B", "#E8E3DE")); else card.Children.Add(EvidenceField(T("siteTiming"), Number(V(probe, "DurationMs")) + " ms"));
                 if (mode == "advanced")
                 {
                     StackPanel fields = new StackPanel(); if (S(probe, "Status").Length > 0) fields.Children.Add(EvidenceField(T("statusColumn"), S(probe, "Status")));
                     string[] addresses = A(V(probe, "Addresses")).Select(delegate(object value) { return Convert.ToString(value, CultureInfo.InvariantCulture); }).ToArray(); if (S(probe, "Address").Length > 0) addresses = addresses.Concat(new[] { S(probe, "Address") }).Distinct().ToArray();
                     if (addresses.Length > 0) fields.Children.Add(EvidenceField(T("probeAddress"), String.Join(Environment.NewLine, addresses))); if (S(probe, "ErrorCode").Length > 0) fields.Children.Add(EvidenceField(T("probeError"), S(probe, "ErrorCode")));
+                    foreach (object item in A(V(probe, "AddressAttempts"))) { Dictionary<string, object> attempt = D(item); fields.Children.Add(EvidenceField(S(attempt, "Address"), S(attempt, "Status") + " · " + Number(V(attempt, "DurationMs")) + " ms" + (S(attempt, "ErrorCode").Length > 0 ? " · " + S(attempt, "ErrorCode") : ""))); }
                     if (fields.Children.Count > 0) { Expander details = new Expander { Header = T("rawTechnicalDetails"), Content = fields, IsExpanded = false, Margin = new Thickness(0, 7, 0, 0) }; AutomationProperties.SetAutomationId(details, "site-details-" + kind); card.Children.Add(details); }
                 }
             }
@@ -823,8 +856,8 @@ namespace NetworkRescue
             Button gateway = MakeButton("monitorAddGateway", delegate { AddMonitorTarget(monitorGateway, "icmp"); }, false, true, delegate { string host, error; return monitorTargets.Count < 4 && AdvancedTools.TryNormalizeHost(monitorGateway, out host, out error); }); gateway.FontSize = 12; gateway.Padding = new Thickness(11, 7, 11, 7); gateway.ToolTip = monitorGateway.Length == 0 ? T("monitorGatewayUnknown") : monitorGateway; ToolTipService.SetShowOnDisabled(gateway, true); add.Children.Add(gateway); card.Children.Add(add);
             if (monitorGateway.Length == 0) card.Children.Add(Text(T("monitorGatewayUnknown"), 11, Muted));
             intervalInput = Input(monitorInterval); countInput = Input(monitorCount); WrapPanel parameters = new WrapPanel(); parameters.Children.Add(Field("monitorInterval", intervalInput, 180)); parameters.Children.Add(Field("monitorSamples", countInput, 180)); card.Children.Add(parameters); card.Children.Add(Text(T("monitorWebHint"), 12, Muted)); card.Children.Add(Text(T("monitorIcmpHint"), 12, Muted)); card.Children.Add(Text(T("monitorSessionPrivacy"), 12, Muted));
-            WrapPanel actions = new WrapPanel(); actions.Children.Add(MakeStartButton("startMonitor", "monitor", StartMonitor)); actions.Children.Add(MakeButton("monitorExport", delegate { Request("exportMonitoring", null); }, false, true, HasMonitorObservations)); card.Children.Add(actions);
-            RenderMonitorPlans(card); results = new StackPanel(); body.Children.Add(results); RenderMonitorResults();
+            WrapPanel actions = new WrapPanel(); actions.Children.Add(MakeStartButton("startMonitor", "monitor", StartMonitor)); actions.Children.Add(MakeButton("monitorExport", delegate { Request("exportMonitoring", loadedMonitorHistory.Length == 0 ? null : Values("id", loadedMonitorHistory)); }, false, true, HasMonitorObservations)); card.Children.Add(actions);
+            RenderMonitorPlans(card); RenderMonitorHistory(); results = new StackPanel(); body.Children.Add(results); RenderMonitorResults();
         }
         private string NextMonitorTargetId() { string id; do { id = "target-" + nextMonitorId++; } while (monitorTargets.Any(delegate(MonitorRow row) { return row.Id == id; })); return id; }
         private void EnsureMonitorTargets() { if (monitorTargets.Count == 0) monitorTargets.Add(new MonitorRow { Id = NextMonitorTargetId(), Host = monitorHost, Method = monitorMethod, Proxy = monitorProxy }); }
@@ -860,7 +893,52 @@ namespace NetworkRescue
         }
         private void StartMonitor()
         {
-            SaveInputs(); int interval, count; object[] targets = MonitorRequestTargets(out interval, out count); if (targets != null) { Start("monitor", Values("targets", targets, "intervalMs", interval, "count", count)); RefreshMonitorCards(); }
+            SaveInputs(); int interval, count; object[] targets = MonitorRequestTargets(out interval, out count); if (targets != null) { ClearMonitorHistorySelection(); Start("monitor", Values("targets", targets, "intervalMs", interval, "count", count)); RefreshMonitorCards(); }
+        }
+        private void ClearMonitorHistorySelection()
+        {
+            selectedMonitorHistory = loadedMonitorHistory = pendingMonitorHistory = ""; historyReplay = null; historyReplaySamples.Clear(); selectedMonitorEvent = null;
+        }
+        private void RenderMonitorHistory()
+        {
+            StackPanel card = Card(body, U("monitorHistoryTitle"), U("monitorHistoryHint")); AutomationProperties.SetAutomationId(card, "monitor-history-card");
+            if (monitorHistoryError.Length > 0) card.Children.Add(Text(U("monitorHistoryReadError"), 12, BrushOf("#865A18")));
+            if (loadedMonitorHistory.Length > 0) card.Children.Add(Text(U("monitorHistoryLoaded"), 13, Purple, true));
+            if (monitorHistory.Length == 0) card.Children.Add(Text(U("monitorHistoryEmpty"), 12, Muted));
+            else
+            {
+                DataGrid table = ReadOnlyTable("monitor-history-table"); table.SelectionMode = DataGridSelectionMode.Single; table.SelectionUnit = DataGridSelectionUnit.FullRow; table.MaxHeight = 240;
+                AddTableColumn(table, "Time", "monitorHistoryTime", 2, 145); AddTableColumn(table, "DisplayState", "monitorHistoryState", 1, 90); AddTableColumn(table, "TargetCount", "monitorHistoryTargets", 0.7, 65); AddTableColumn(table, "SampleCount", "monitorHistorySamples", 0.7, 65);
+                Dictionary<string, object>[] rows = monitorHistory.Select(D).Where(delegate(Dictionary<string, object> entry) { return entry != null; }).Select(delegate(Dictionary<string, object> entry) { Dictionary<string, object> row = new Dictionary<string, object>(entry); row["Time"] = DateText(V(entry, "StartedUtc")); string state = S(entry, "State"); row["DisplayState"] = U("monitorHistory" + (new[] { "Completed", "Stopped", "Cancelled", "Interrupted", "Failed", "Running" }.Contains(state) ? state : "Unknown")); row["StateBrush"] = Ink; return row; }).ToArray();
+                table.ItemsSource = rows; table.SelectedItem = rows.FirstOrDefault(delegate(Dictionary<string, object> entry) { return S(entry, "Id") == selectedMonitorHistory; });
+                table.SelectionChanged += delegate { selectedMonitorHistory = S(table.SelectedItem as Dictionary<string, object>, "Id"); UpdateLocks(); }; card.Children.Add(table);
+            }
+            WrapPanel actions = new WrapPanel(); actions.Children.Add(SmallButton("monitorHistoryRefresh", delegate { Request("monitorHistory", null); }));
+            actions.Children.Add(SmallButton("monitorHistoryLoad", delegate { if (busy != null || selectedMonitorHistory.Length == 0) return; SaveInputs(); pendingMonitorHistory = selectedMonitorHistory; Request("loadMonitoring", Values("id", pendingMonitorHistory)); }, delegate { return selectedMonitorHistory.Length > 0; }));
+            actions.Children.Add(SmallButton("monitorHistoryDelete", delegate { if (busy == null && selectedMonitorHistory.Length > 0) Request("deleteMonitoring", Values("id", selectedMonitorHistory)); }, delegate { return selectedMonitorHistory.Length > 0; }));
+            actions.Children.Add(SmallButton("monitorHistoryClear", delegate { if (busy == null) Request("clearMonitoring", null); }, delegate { return monitorHistory.Length > 0; })); card.Children.Add(actions);
+        }
+        private void ApplyMonitorHistory(Dictionary<string, object> data)
+        {
+            string id = S(data, "id"); if (busy != null || pendingMonitorHistory.Length == 0 || id != pendingMonitorHistory) return;
+            List<MonitorRow> rows = new List<MonitorRow>();
+            foreach (object item in A(V(data, "targets")))
+            {
+                Dictionary<string, object> target = D(item); string targetId = S(target, "Id"), method = S(target, "Method").ToLowerInvariant();
+                if (targetId.Length == 0 || rows.Any(delegate(MonitorRow row) { return row.Id == targetId; }) || (method != "https" && method != "icmp")) continue;
+                rows.Add(new MonitorRow { Id = targetId, Host = S(target, "Host"), Method = method, Proxy = B(target, "UseSystemProxy") });
+            }
+            if (rows.Count == 0) { pendingMonitorHistory = ""; Notice(U("monitorHistoryReadError")); return; }
+            SaveInputs(); monitorSessionTargets.Clear(); monitorSessionTargets.AddRange(rows); loadedMonitorHistory = id; pendingMonitorHistory = ""; selectedMonitorEvent = null; historyReplay = null; historyReplaySamples.Clear();
+            monitorSessionIntervalMs = Math.Max(1000, (int)N(data, "intervalMs")); monitorEvents.Clear(); monitorEventRows.Clear(); monitorEventTotal = (int)N(data, "totalEvents"); monitorEventTruncated = B(data, "truncated"); monitorFailed = S(data, "state") == "Failed";
+            monitor = null; samples.Clear(); ApplyMonitorEndSnapshots(data); if (page == "monitor") RenderPage();
+        }
+        private void SelectMonitorEvent(Dictionary<string, object> selected)
+        {
+            Dictionary<string, object> next = selected == null ? null : monitorEvents.FirstOrDefault(delegate(Dictionary<string, object> value) { return N(value, "Sequence") == N(selected, "Sequence"); });
+            bool changed = (next == null) != (selectedMonitorEvent == null) || N(next, "Sequence") != N(selectedMonitorEvent, "Sequence"); selectedMonitorEvent = next;
+            if (changed) { historyReplay = null; historyReplaySamples.Clear(); if (loadedMonitorHistory.Length > 0 && next != null && busy == null) Request("replayMonitoring", Values("id", loadedMonitorHistory, "sequence", (int)N(next, "Sequence"))); }
+            RenderMonitorReplay(); RefreshMonitorCards();
         }
         private void RenderMonitorResults()
         {
@@ -872,7 +950,7 @@ namespace NetworkRescue
             DataGrid table = ReadOnlyTable("monitor-timeline"); table.Height = 300; table.MinHeight = 150; table.EnableColumnVirtualization = true; table.CanUserSortColumns = false; table.ClipboardCopyMode = DataGridClipboardCopyMode.IncludeHeader; VirtualizingStackPanel.SetIsVirtualizing(table, true); VirtualizingStackPanel.SetVirtualizationMode(table, System.Windows.Controls.VirtualizationMode.Recycling); ScrollViewer.SetCanContentScroll(table, true);
             AddTableColumn(table, "Time", "monitorEventTime", 1.1, 140); AddTableColumn(table, "Subject", "monitorEventSubject", 1.3, 150); AddTableColumn(table, "Change", "monitorEventChange", 2.5, 250);
             LimitEventTable(table, new[] { "Time", "Subject", "Change" });
-            table.SelectionChanged += delegate { if (monitorTimelineUpdating) return; Dictionary<string, object> selected = table.SelectedItem as Dictionary<string, object>; selectedMonitorEvent = selected == null ? null : monitorEvents.FirstOrDefault(delegate(Dictionary<string, object> value) { return N(value, "Sequence") == N(selected, "Sequence"); }); RenderMonitorReplay(); RefreshMonitorCards(); };
+            table.SelectionChanged += delegate { if (!monitorTimelineUpdating) SelectMonitorEvent(table.SelectedItem as Dictionary<string, object>); };
             table.ItemsSource = monitorEventRows; timeline.Children.Add(table); UpdateMonitorEventCount(); monitorReplayPanel = Card(results, U("monitorReplayTitle"), U("monitorReplayHint")); AutomationProperties.SetAutomationId(monitorReplayPanel, "monitor-replay"); RenderMonitorReplay();
             if (selectedMonitorEvent != null) table.SelectedItem = monitorEventRows.FirstOrDefault(delegate(Dictionary<string, object> value) { return N(value, "Sequence") == N(selectedMonitorEvent, "Sequence"); });
         }
@@ -896,7 +974,7 @@ namespace NetworkRescue
             card.Children.Add(Text(host, 16, Ink, true)); card.Children.Add(Text(T(web ? "monitorHttps" : "monitorIcmp") + " · " + T(web ? (S(value, "Route").Length == 0 ? row.Proxy : S(value, "Route") == "WindowsProxy") ? "monitorProxyFollow" : "monitorProxyDirect" : "monitorIcmpHint"), 11, Muted));
             card.Children.Add(EvidenceField(T(web ? "monitorWebSent" : "monitorSent"), value == null ? "—" : S(value, "Received") + " / " + S(value, "Sent"))); card.Children.Add(EvidenceField(T(web ? "monitorNoResponse" : "monitorLoss"), Number(V(value, "LossPercent")) + " %")); card.Children.Add(EvidenceField(T(web ? "monitorWebAvg" : "monitorAvg"), Number(V(value, "Avg")) + " ms")); card.Children.Add(EvidenceField(T(web ? "monitorWebJitter" : "monitorJitter"), Number(V(value, "JitterMs")) + " ms"));
             WrapPanel legend = new WrapPanel { Margin = new Thickness(0, 8, 0, 4) }; AutomationProperties.SetAutomationId(legend, "monitor-legend-" + row.Id); legend.Children.Add(MonitorLegendItem("monitorCurveResponseLegend", false)); legend.Children.Add(MonitorLegendItem("monitorCurveNoResponseLegend", true)); card.Children.Add(legend); card.Children.Add(Text(U("monitorCurveYAxis"), 11, Muted));
-            Canvas targetChart = new Canvas { Height = 200, Background = BrushOf("#FAFAFE"), ClipToBounds = true }; AutomationProperties.SetAutomationId(targetChart, "monitor-chart-" + row.Id); targetChart.SizeChanged += delegate { DrawMonitorChart(targetChart, row.Samples); }; card.Children.Add(targetChart); if (row == ActiveMonitorTargets()[0]) chart = targetChart; DrawMonitorChart(targetChart, row.Samples);
+            Canvas targetChart = new Canvas { Height = 200, Background = BrushOf("#FAFAFE"), ClipToBounds = true }; AutomationProperties.SetAutomationId(targetChart, "monitor-chart-" + row.Id); targetChart.SizeChanged += delegate { DrawMonitorChart(targetChart, MonitorDisplaySamples(row)); }; card.Children.Add(targetChart); if (row == ActiveMonitorTargets()[0]) chart = targetChart; DrawMonitorChart(targetChart, MonitorDisplaySamples(row));
             card.Children.Add(Text(U("monitorCurveXAxis"), 11, Muted)); TextBlock meaning = Text(U("monitorCurveMeaning"), 11, Muted); meaning.LineHeight = 19; meaning.Margin = new Thickness(0, 4, 0, 9); card.Children.Add(meaning);
             card.Children.Add(Text(T(busy == "monitor" ? "monitorRunning" : monitorFailed ? "monitorSessionFailed" : value == null ? "notStarted" : "monitorFinished"), 12, Purple, true));
             if (value != null) { string target = S(value, "ResolvedAddress"); if (target.Length > 0) card.Children.Add(EvidenceField(T(web ? "monitorHttpsTarget" : "actualTarget"), target)); card.Children.Add(Text(T("monitorMinMax") + " · " + Number(V(value, "Min")) + " / " + Number(V(value, "Max")) + " ms", 12, Muted)); if (web) { card.Children.Add(Text(T("monitorHttpMeaning"), 11, Muted)); if (V(value, "HttpStatusCode") != null) card.Children.Add(Text(T("monitorLastHttp") + " · HTTP " + S(value, "HttpStatusCode"), 12, Ink, true)); } if (N(value, "Sent") > 0 && N(value, "Received") == 0) card.Children.Add(Text(T(web ? "monitorHttpNoReply" : "monitorIcmpNoReply"), 12, Ink)); if (N(value, "HttpStatusCode") == 407) card.Children.Add(Text(T("monitorProxyAuth"), 12, Ink)); if (N(value, "Sent") == 0 && S(value, "ErrorCode").Length > 0) card.Children.Add(Text(T("monitorUnavailable") + " · " + S(value, "ErrorCode"), 12, Muted)); }
@@ -922,23 +1000,30 @@ namespace NetworkRescue
                 else { y = 187; segment = null; }
                 Ellipse dot = new Ellipse { Width = success ? 4 : 6, Height = success ? 4 : 6, Fill = success ? Purple : BrushOf("#C57B80") }; Canvas.SetLeft(dot, x - dot.Width / 2); Canvas.SetTop(dot, y - dot.Height / 2); targetChart.Children.Add(dot);
             }
-            if (points.Count == 0) { TextBlock empty = Text(T("monitorChartEmpty"), 12, Muted); empty.Width = width - 32; empty.TextAlignment = TextAlignment.Center; Canvas.SetLeft(empty, 16); Canvas.SetTop(empty, 88); targetChart.Children.Add(empty); }
+            if (points.Count == 0) { TextBlock empty = Text(T(loadedMonitorHistory.Length > 0 && selectedMonitorEvent != null ? "monitorReplayNoSample" : "monitorChartEmpty"), 12, Muted); empty.Width = width - 32; empty.TextAlignment = TextAlignment.Center; Canvas.SetLeft(empty, 16); Canvas.SetTop(empty, 88); targetChart.Children.Add(empty); }
             DateTime selectedUtc; if (timeAxis && TryUtc(V(selectedMonitorEvent, "TimeUtc"), out selectedUtc) && selectedUtc >= firstUtc && selectedUtc <= lastUtc)
             {
                 double x = 14 + (selectedUtc - firstUtc).TotalMilliseconds / (lastUtc - firstUtc).TotalMilliseconds * (width - 28); System.Windows.Shapes.Line marker = new System.Windows.Shapes.Line { X1 = x, X2 = x, Y1 = 12, Y2 = 190, Stroke = BrushOf("#B67B24"), StrokeThickness = 1.5, StrokeDashArray = new DoubleCollection(new[] { 4.0, 3.0 }), ToolTip = U("monitorReplaySelectedTime") + " · " + DateText(selectedUtc) }; AutomationProperties.SetAutomationId(marker, "monitor-replay-marker"); targetChart.Children.Add(marker);
             }
+        }
+        private List<Dictionary<string, object>> MonitorDisplaySamples(MonitorRow row)
+        {
+            if (loadedMonitorHistory.Length == 0 || selectedMonitorEvent == null) return row.Samples;
+            List<Dictionary<string, object>> replaySamples; return historyReplay != null && historyReplaySamples.TryGetValue(row.Id, out replaySamples) ? replaySamples : new List<Dictionary<string, object>>();
         }
         private void RenderMonitorReplay()
         {
             if (page != "monitor" || monitorReplayPanel == null) return; monitorReplayPanel.Children.Clear(); monitorReplayPanel.Children.Add(Text(U("monitorReplayTitle"), 18, Ink, true)); monitorReplayPanel.Children.Add(Text(U("monitorReplayHint"), 12, Muted));
             DateTime selectedUtc; if (selectedMonitorEvent == null || !TryUtc(V(selectedMonitorEvent, "TimeUtc"), out selectedUtc)) { monitorReplayPanel.Children.Add(Text(U("monitorReplayEmpty"), 13, Muted)); return; }
             monitorReplayPanel.Children.Add(EvidenceField(U("monitorReplaySelectedTime"), DateText(selectedUtc))); Dictionary<string, object> description = MonitorEventRow(selectedMonitorEvent); TextBox eventText = Output(S(description, "Subject") + " · " + S(description, "Change"), 42); eventText.MaxHeight = 88; monitorReplayPanel.Children.Add(eventText); monitorReplayPanel.Children.Add(Text(U("monitorReplayWindow"), 11, Muted));
+            if (historyReplay != null && V(historyReplay, "durationMs") != null) monitorReplayPanel.Children.Add(EvidenceField(U("monitorReplayUnresponsiveDuration"), Number(N(historyReplay, "durationMs") / 1000) + " s · " + U(B(historyReplay, "recovered") ? "monitorReplayRecovered" : "monitorReplayUnrecovered")));
             System.Windows.Controls.Primitives.UniformGrid targets = new System.Windows.Controls.Primitives.UniformGrid { Columns = 1 }; targets.SizeChanged += delegate { targets.Columns = targets.ActualWidth >= 700 && targets.Children.Count > 1 ? 2 : 1; }; monitorReplayPanel.Children.Add(targets);
             foreach (MonitorRow row in ActiveMonitorTargets())
             {
                 string host = S(row.Summary, "TargetHost"); if (host.Length == 0) host = S(row.Summary, "Host"); if (host.Length == 0) host = row.Host; StackPanel card = Card(targets, host, T(row.Method == "icmp" ? "monitorIcmp" : "monitorHttps")); ((Border)card.Parent).Margin = new Thickness(0, 5, 10, 8); AutomationProperties.SetAutomationId(card, "monitor-replay-target-" + row.Id);
                 Dictionary<string, object> nearest = null; double offset = Double.MaxValue; DateTime nearestUtc = DateTime.MinValue;
-                foreach (Dictionary<string, object> sample in row.Samples) { DateTime sampleUtc; if (!TryUtc(V(sample, "TimeUtc"), out sampleUtc)) continue; double distance = Math.Abs((sampleUtc - selectedUtc).TotalMilliseconds); if (distance < offset) { nearest = sample; offset = distance; nearestUtc = sampleUtc; } }
+                List<Dictionary<string, object>> replaySamples = MonitorDisplaySamples(row);
+                foreach (Dictionary<string, object> sample in replaySamples) { DateTime sampleUtc; if (!TryUtc(V(sample, "TimeUtc"), out sampleUtc)) continue; double distance = Math.Abs((sampleUtc - selectedUtc).TotalMilliseconds); if (distance < offset) { nearest = sample; offset = distance; nearestUtc = sampleUtc; } }
                 if (nearest == null || offset > Math.Max(2000, monitorSessionIntervalMs)) { card.Children.Add(Text(U("monitorReplayNoSample"), 12, Muted)); continue; }
                 bool responded = B(nearest, "ResponseReceived") || B(nearest, "Success") || V(nearest, "HttpStatusCode") != null; card.Children.Add(EvidenceField(U("monitorReplaySampleTime"), DateText(nearestUtc))); card.Children.Add(EvidenceField(U("monitorReplayOffset"), Number(offset / 1000) + " s")); card.Children.Add(EvidenceField(U("monitorReplayResponse"), U(responded ? "monitorReplayResponded" : "monitorReplayNoResponse") + (V(nearest, "HttpStatusCode") != null ? " · HTTP " + S(nearest, "HttpStatusCode") : "") + (V(nearest, "RttMs") != null ? " · " + Number(V(nearest, "RttMs")) + " ms" : "")));
             }
@@ -956,6 +1041,7 @@ namespace NetworkRescue
         }
         private void ApplyMonitorStarted(Dictionary<string, object> data)
         {
+            ClearMonitorHistorySelection();
             SaveInputs(); EnsureMonitorTargets(); monitorSessionTargets.Clear(); selectedMonitorEvent = null; int interval; if (Int32.TryParse(monitorInterval, out interval)) monitorSessionIntervalMs = interval; object[] targets = A(V(data, "targets")); List<MonitorRow> started = new List<MonitorRow>();
             if (targets.Length > 0 && targets.Length <= 4)
             {

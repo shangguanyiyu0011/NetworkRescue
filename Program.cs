@@ -11,9 +11,9 @@ using System.Security.Principal;
 [assembly: AssemblyTitle("断网急救箱")]
 [assembly: AssemblyDescription("先诊断，再修复的 Windows 网络工具")]
 [assembly: AssemblyProduct("断网急救箱")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
-[assembly: AssemblyInformationalVersion("1.0.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyInformationalVersion("1.1.0")]
 [assembly: System.Runtime.Versioning.TargetFramework(".NETFramework,Version=v4.8")]
 
 namespace NetworkRescue

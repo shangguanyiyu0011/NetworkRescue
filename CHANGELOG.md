@@ -1,5 +1,15 @@
 # 更新记录
 
+## 1.1.0 · 2026-10-28
+
+[发行页](https://github.com/shangguanyiyu0011/NetworkRescue/releases/tag/v1.1.0)与[同版本对应源码](https://github.com/shangguanyiyu0011/NetworkRescue/tree/v1.1.0)。产品版本 1.1.0，程序集/文件版本 1.1.0.0。
+
+- 监测手动开始后自动本地加密保存，每 15 秒及结束/关闭时保存；最多 20 条、总计 64 MiB。每目标最多 3600 个真实样本，图表最近 300 点，事件最多 500 条并提示截断。支持跨启动只读回放；Interrupted 恢复意外中断前最后检查点，最多 15 秒样本可能未保存。损坏记录不覆盖不删除，清空只删除可读记录，兼容旧设置及历史文件。
+- 网站专项分别强制 IPv4/IPv6 HTTP(S) 检测，保留原始域名和默认 TLS 验证；每族最多 2 个地址、总计 3 秒。无 AAAA 不适用，局部未确认不自动禁用协议。
+- 疑似门户提供用户确认的手动入口，由系统浏览器打开 Windows 网络认证触发页；不是已确认的实际门户，不自动登录，认证后可重新诊断。
+- 四种修复范围不变；十语文案和产品说明同步更新。
+- 18 套检查、双架构包和实窗等本版验证待完成，见 [1.1 验证记录](docs/RELEASE-READINESS.v1.1.md)。1.0.0 测试计数及截图仅属历史证据，不转作本版通过结果。
+
 ## 1.0.0 · 2026-10-26
 
 首个正式开源版本，开发与维护：上官一羽。自有代码采用 GPL-3.0-only；[发行页](https://github.com/shangguanyiyu0011/NetworkRescue/releases/tag/v1.0.0)与[同版本对应源码](https://github.com/shangguanyiyu0011/NetworkRescue/tree/v1.0.0)。
