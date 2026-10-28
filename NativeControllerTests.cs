@@ -32,6 +32,11 @@ namespace NetworkRescue
                 MultiMonitorBridgeChecks();
                 MonitoringRetentionChecks();
                 MonitoringHistoryBridgeChecks();
+                MonitoringDisplayProjectionChecks();
+                MonitoringReplayGapChecks();
+                MonitoringSummaryPreviewChecks();
+                TrayLifecycleChecks();
+                MonitoringHtmlSelectionChecks();
                 MonitoringPersistenceFailureChecks();
                 WifiMonitoringBridgeChecks();
                 MonitoringCaptureCancellationChecks();
@@ -270,7 +275,7 @@ namespace NetworkRescue
             Check(typeof(NativeController).GetField("operation", flags).GetValue(controller) == null && !Directory.Exists(guardedRoot), "Automatic save retains the complete configuration gate");
             ((Task)typeof(NativeController).GetMethod("Dispatch", flags).Invoke(controller, new object[] { new Dictionary<string, object> { { "command", "saveHealthProfile" }, { "autoName", false }, { "name", "Manual fixture" } } })).GetAwaiter().GetResult();
             Check(typeof(NativeController).GetField("operation", flags).GetValue(controller) == null && !Directory.Exists(guardedRoot), "Explicit false with a valid manual name follows the original healthy report gate");
-            Check(NativeController.DisplayVersion == "1.2.0", "Controller display version matches 1.2.0");
+            Check(NativeController.DisplayVersion == "1.3.0", "Controller display version matches 1.3.0");
         }
 
         private static void HealthComparisonBudgetChecks()
@@ -418,12 +423,149 @@ namespace NetworkRescue
             Dictionary<string, object> first = ((System.Collections.IEnumerable)replay["series"]).Cast<Dictionary<string, object>>().First();
             Dictionary<string, object>[] points = ((System.Collections.IEnumerable)first["samples"]).Cast<Dictionary<string, object>>().ToArray();
             Check(points.Length > 0 && points.Any(delegate(Dictionary<string, object> point) { return (int)point["Sequence"] == 5; }), "History replay retrieves an actual early outage point outside the live 300-point cache");
-            Check((bool)replay["recovered"] && Convert.ToInt64(replay["durationMs"]) == 1000, "History non-response duration uses observed recovery time");
+            Check((bool)replay["recovered"] && Convert.ToInt64(replay["durationMs"]) == 0, "A single failed probe has zero observed duration even when the following probe recovers");
             string exported = NativeController.BuildMonitoringRecordText(record, delegate(string key) { return key; });
             Check(exported.Contains(" · 5 · ") && exported.Contains(" · 600 · ") && exported.Contains("monitorEventTargetNoResponse"), "Historical export includes early and recent real samples with the event timeline");
             bool rejected = false;
             try { NativeController.BuildMonitoringReplay(record, Int32.MaxValue); } catch (InvalidDataException) { rejected = true; }
             Check(rejected, "Replay rejects a missing event instead of manufacturing an observation");
+        }
+
+        private static Dictionary<string, object> Packet(object value)
+        {
+            var serializer = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = NativeController.MaximumUiJsonLength, RecursionLimit = 32 };
+            return serializer.Deserialize<Dictionary<string, object>>(serializer.Serialize(value));
+        }
+        private static Dictionary<string, object>[] Rows(object value) { return ((System.Collections.IEnumerable)value).Cast<Dictionary<string, object>>().ToArray(); }
+        private static MonitorSample DisplaySample(MonitorTarget target, DateTime start, int sequence, bool response)
+        {
+            return new MonitorSample { TargetId = target.Id, TargetHost = target.Host, Method = target.Method == "icmp" ? "ICMP" : "HTTPS", Route = target.Method == "icmp" ? "Network" : "Direct",
+                Sequence = sequence, TimeUtc = start.AddSeconds(sequence), Sent = sequence, Received = sequence - 1, Success = response, ResponseReceived = target.Method == "https" && response,
+                HttpSuccess = target.Method == "https" && response, HttpStatusCode = target.Method == "https" && response ? (int?)200 : null,
+                Status = response ? "Success" : "TimedOut", RttMs = response ? (long?)(sequence * 10) : null, LossPercent = 100.0 / sequence, Min = 1, Max = 900, Avg = 400, JitterMs = 700 };
+        }
+        private static void MonitoringDisplayProjectionChecks()
+        {
+            DateTime start = DateTime.UtcNow.AddMinutes(-10); var target = new MonitorTarget { Id = "retained", Host = "retained.example.test", Method = "icmp" };
+            MonitorTarget[] targets = { target }; MonitorSample[] raw = { DisplaySample(target, start, 1, true), DisplaySample(target, start, 3, true) };
+            raw[0].Received = 1; raw[0].LossPercent = 0;
+            MonitorSample[] shown = NativeController.BuildMonitoringDisplaySamples(raw, 1000);
+            Check(shown.Length == 2 && shown[0].Sequence == 1 && shown[1].Sequence == 3 && shown[1].Sent == 2 && shown[1].Received == 2 && shown[1].LossPercent == 0, "Dropped stale attempt leaves retained sequence identities and a measured two of two denominator");
+            Check(shown[1].Min == 10 && shown[1].Avg == 20 && shown[1].Max == 30 && shown[1].JitterMs == null, "Display RTT statistics are rebuilt and jitter never crosses a sequence gap");
+            Check(!Object.ReferenceEquals(shown[0], raw[0]) && raw[1].Sent == 3 && raw[1].Received == 2 && raw[1].Avg == 400 && raw[1].JitterMs == 700, "Display projection is detached and preserves raw producer evidence");
+            shown[0].Status = "changed-view";
+            Check(raw[0].Status == "Success", "A display mutation cannot rewrite the archived sample");
+            var record = new MonitoringHistoryRecord { Id = Guid.NewGuid().ToString("N"), State = "Completed", StartedUtc = start, EndedUtc = start.AddSeconds(4), IntervalMs = 1000, RequestedCount = 3, Targets = targets, Samples = raw };
+            MonitoringTargetSummary summary = MonitoringSummaryBuilder.Build(record).Targets.Single();
+            MonitorSummary final = NativeController.BuildMonitoringFinal(targets, raw, 1000, record.StartedUtc, record.EndedUtc).Targets.Single();
+            Check(summary.SampleCount == 2 && summary.ResponseCount == 2 && final.Sent == summary.SampleCount && final.Received == summary.ResponseCount && final.LossPercent == 0 && final.Status == "Responding" && final.JitterMs == null, "Ended final counters and summary share retained observation denominator");
+            Dictionary<string, object>[] series = Rows(Packet(new { series = NativeController.BuildMonitoringDisplaySeries(targets, raw, 1000) })["series"]);
+            Dictionary<string, object> latest = Rows(series.Single()["samples"]).Last();
+            Check((int)latest["Sequence"] == 3 && (int)latest["Sent"] == summary.SampleCount && (int)latest["Received"] == summary.ResponseCount && Convert.ToDouble(latest["LossPercent"]) == 0, "Historical and ended chart series share the same observed denominator");
+            var session = new NativeController.MonitoringSession(targets) { StartedUtc = record.StartedUtc, EndedUtc = record.EndedUtc, RequestedCount = 3 };
+            foreach (MonitorSample sample in raw) session.Append(sample);
+            string report = NativeController.BuildMonitoringText(session, delegate(string key) { return key; });
+            Check(report.Contains("monitorSent: 2/2") && !report.Contains("monitorSent: 2/3"), "Monitoring text never reintroduces the removed attempt into its denominator");
+            string historyText = NativeController.BuildMonitoringRecordText(record, delegate(string key) { return key; });
+            Check(historyText.Contains("monitorSent: 2/2") && !historyText.Contains("monitorSent: 2/3"), "Historical text uses the same observed counts as the historical summary");
+            MonitorSample[] empty = new MonitorSample[0];
+            final = NativeController.BuildMonitoringFinal(targets, empty, 1000, start, start.AddSeconds(4)).Targets.Single();
+            Check(final.Status == "NotMeasured" && final.Sent == 0 && final.Received == 0 && !final.Success && !final.ResponseReceived && !final.HttpSuccess && final.RttMs == null && final.ErrorCode == null && final.LossPercent == 0, "An empty target is not measured with zero counts and no invented response RTT or error");
+            var producer = new MultiMonitorSummary { Targets = new[] { new MonitorSummary { TargetId = target.Id, Host = target.Host, Sent = 0, ErrorCode = "ResolveHostNotFound", Status = "Unknown", Method = "ICMP", Route = "Network" } } };
+            final = NativeController.BuildMonitoringFinal(targets, empty, 1000, start, start.AddSeconds(4), producer).Targets.Single();
+            Check(final.Sent == 0 && final.Received == 0 && !final.Success && final.RttMs == null && final.ErrorCode == "ResolveHostNotFound", "DNS resolution failure before any producer attempt survives an empty retained sample set");
+            Check(producer.Targets[0].ErrorCode == "ResolveHostNotFound" && producer.Targets[0].Sent == 0, "Final summary preserves producer evidence without mutating the producer graph");
+            producer.Targets[0].Sent = 2; producer.Targets[0].ErrorCode = "PingTimeout"; producer.Targets[0].RttMs = 999;
+            final = NativeController.BuildMonitoringFinal(targets, empty, 1000, start, start.AddSeconds(4), producer).Targets.Single();
+            Check(final.Status == "NotMeasured" && final.Sent == 0 && final.Received == 0 && !final.Success && final.RttMs == null && final.ErrorCode == null, "Producer attempts discarded across a stale boundary cannot invent measured results");
+            producer.Targets[0].Sent = 0; producer.Targets[0].ErrorCode = "PingUnavailable";
+            final = NativeController.BuildMonitoringFinal(targets, empty, 1000, start, start.AddSeconds(4), producer).Targets.Single();
+            Check(final.ErrorCode == null && final.Status == "NotMeasured", "Only explicit pre-attempt Resolve errors are preserved from an empty producer result");
+            record.Samples = empty; summary = MonitoringSummaryBuilder.Build(record).Targets.Single();
+            Check(summary.SampleCount == 0 && summary.ResponseCount == 0 && summary.Intervals.Length == 0 && summary.Gaps.Single().Reason == "NotMeasured", "Empty target summary remains unknown rather than manufacturing an outage");
+            MonitorSample lifecycle = DisplaySample(target, start, 1, true); lifecycle.Status = "Suspended"; lifecycle.ErrorCode = "OldError";
+            final = NativeController.BuildMonitoringFinal(targets, new[] { lifecycle }, 1000, start, start.AddSeconds(4)).Targets.Single();
+            Check(final.Status == "NotMeasured" && final.Sent == 0 && final.RttMs == null && final.ErrorCode == null && !final.Success, "Unmeasured lifecycle markers cannot create successful or failed probes");
+            MonitorSample[] many = Enumerable.Range(1, 301).Select(delegate(int i) { return DisplaySample(target, start, i, i != 1); }).ToArray();
+            series = Rows(Packet(new { series = NativeController.BuildMonitoringDisplaySeries(targets, many, 1000) })["series"]);
+            Dictionary<string, object>[] retained = Rows(series.Single()["samples"]);
+            Check(retained.Length == 300 && (int)retained[0]["Sequence"] == 2 && (int)retained[0]["Sent"] == 2 && (int)retained[0]["Received"] == 1 && (int)retained.Last()["Sent"] == 301 && (int)retained.Last()["Received"] == 300, "Chart statistics use the full archive before taking the final 300 samples");
+        }
+
+        private static void MonitoringReplayGapChecks()
+        {
+            DateTime start = DateTime.UtcNow.AddMinutes(-5); var target = new MonitorTarget { Id = "gap-replay", Host = "gap.example.test", Method = "icmp" };
+            var record = new MonitoringHistoryRecord { Id = Guid.NewGuid().ToString("N"), State = "Completed", StartedUtc = start, EndedUtc = start.AddSeconds(30), IntervalMs = 1000, RequestedCount = 3,
+                Targets = new[] { target }, Samples = new[] { DisplaySample(target, start, 1, false), DisplaySample(target, start, 3, true) }, TotalEvents = 2,
+                Events = new[] { new NetworkChangeEvent { Sequence = 1, TimeUtc = start.AddSeconds(1), Kind = "TargetNoResponse", TargetId = target.Id, TargetHost = target.Host }, new NetworkChangeEvent { Sequence = 2, TimeUtc = start.AddSeconds(3), Kind = "TargetRecovered", TargetId = target.Id, TargetHost = target.Host } } };
+            Dictionary<string, object> replay = Packet(NativeController.BuildMonitoringReplay(record, 1));
+            Check(replay["durationMs"] != null && Convert.ToInt64(replay["durationMs"]) == 0 && !(bool)replay["recovered"], "A later recovery event across a sampling gap cannot bridge or lengthen the observed interval");
+            record.Samples = new[] { DisplaySample(target, start, 1, false), DisplaySample(target, start, 2, false) };
+            replay = Packet(NativeController.BuildMonitoringReplay(record, 1));
+            Check(Convert.ToInt64(replay["durationMs"]) == 1000 && !(bool)replay["recovered"], "An open two-probe interval spans only its real failed sample endpoints and never session end");
+            record.Samples = new MonitorSample[0]; replay = Packet(NativeController.BuildMonitoringReplay(record, 1));
+            Check(replay["durationMs"] == null && !(bool)replay["recovered"], "An event without an associated real sample has unknown duration rather than fabricated outage evidence");
+        }
+
+        private static void MonitoringSummaryPreviewChecks()
+        {
+            DateTime start = DateTime.UtcNow.AddHours(-2); MonitorTarget[] targets = Enumerable.Range(1, 4).Select(delegate(int i) { return new MonitorTarget { Id = "preview-" + i, Host = "preview" + i + ".example.test", Method = "icmp" }; }).ToArray();
+            var record = new MonitoringHistoryRecord { Id = Guid.NewGuid().ToString("N"), State = "Completed", StartedUtc = start, EndedUtc = start.AddSeconds(3601), IntervalMs = 1000, RequestedCount = 3600, Targets = targets };
+            record.Samples = targets.SelectMany(delegate(MonitorTarget target) { return Enumerable.Range(1, 3600).Select(delegate(int i) { return DisplaySample(target, start, i, i % 2 == 0); }); }).ToArray();
+            Dictionary<string, object> preview = Packet(NativeController.BuildMonitoringSummaryPreview(record)); Dictionary<string, object>[] rows = Rows(preview["Targets"]);
+            Check((int)preview["TotalIntervals"] == 7200 && (bool)preview["Truncated"] && rows.Sum(delegate(Dictionary<string, object> row) { return Rows(row["Intervals"]).Length; }) == 200, "A 7200 interval summary computes full totals while previewing at most 200 intervals across all targets");
+            Check(rows.Sum(delegate(Dictionary<string, object> row) { return (int)row["TotalIntervals"]; }) == 7200 && rows.All(delegate(Dictionary<string, object> row) { return (int)row["SampleCount"] == 3600 && (int)row["ResponseCount"] == 1800; }), "Preview caps never shrink per-target sample counts or interval totals");
+            record.Samples = targets.SelectMany(delegate(MonitorTarget target) { return Enumerable.Range(0, 1800).Select(delegate(int i) { return DisplaySample(target, start, 2 * i + 1, true); }); }).ToArray();
+            preview = Packet(NativeController.BuildMonitoringSummaryPreview(record)); rows = Rows(preview["Targets"]);
+            Check((int)preview["GapCount"] == 7200 && (int)preview["TotalIntervals"] == 0 && (bool)preview["Truncated"] && rows.Sum(delegate(Dictionary<string, object> row) { return Rows(row["Gaps"]).Length; }) == 200, "Gap preview shares a global 200 item bound and retains all 7200 missing-observation gaps in its totals");
+        }
+
+        private static void TrayLifecycleChecks()
+        {
+            Check(NativeController.ShouldHideOnClose(true, "monitor", false), "Only an enabled active monitor can hide on normal close");
+            foreach (string operation in new[] { (string)null, "repair", "diagnose", "speed", "site" }) Check(!NativeController.ShouldHideOnClose(true, operation, false), "Closing a non-monitor operation cannot unexpectedly hide: " + operation);
+            Check(!NativeController.ShouldHideOnClose(false, "monitor", false) && !NativeController.ShouldHideOnClose(true, "monitor", true), "Disabled tray and explicit exit never hide the monitor");
+            foreach (string command in new[] { "setTray", "setTrayMuted", "hideToTray" }) Check(NativeController.AllowsTrayCommand(command, "monitor") && !NativeController.AllowsTrayCommand(command, "repair"), "Only monitor-safe tray command bypasses busy guard: " + command);
+            Check(NativeController.AllowsTrayCommand("exitApplication", "repair") && !NativeController.AllowsTrayCommand("scan", "monitor") && !NativeController.AllowsTrayCommand("exportMonitoringHtml", "monitor"), "Exit reaches normal close handling while unrelated commands retain busy guards");
+            BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic; NativeController controller = UninitializedController();
+            var tracker = new MonitorAlertTracker(TimeSpan.Zero, TimeSpan.Zero); tracker.BeginSession(new[] { "alert" }, 1000);
+            typeof(NativeController).GetField("alertGate", flags).SetValue(controller, new object()); typeof(NativeController).GetField("alerts", flags).SetValue(controller, tracker);
+            typeof(NativeController).GetField("trayEnabled", flags).SetValue(controller, true); typeof(NativeController).GetField("notificationEpoch", flags).SetValue(controller, 7L);
+            DateTime floor = DateTime.UtcNow; typeof(NativeController).GetField("notificationFloorUtc", flags).SetValue(controller, floor);
+            MethodInfo deliver = typeof(NativeController).GetMethod("IsAlertDeliveryCurrent", flags), current = typeof(NativeController).GetMethod("IsObservationCurrent", flags), power = typeof(NativeController).GetMethod("OnPowerModeChanged", flags);
+            Check((bool)deliver.Invoke(controller, new object[] { 7L, floor }) && !(bool)deliver.Invoke(controller, new object[] { 6L, floor }) && !(bool)deliver.Invoke(controller, new object[] { 7L, floor.AddTicks(-1) }), "Queued alerts require both the current epoch and post-resume observation floor");
+            Check(!(bool)current.Invoke(controller, new object[] { floor.AddTicks(-1) }) && (bool)current.Invoke(controller, new object[] { floor }), "Old in-flight observations are filtered independently of alert delivery");
+            var target = new MonitorTarget { Id = "alert", Host = "alert.example.test", Method = "icmp" };
+            tracker.Observe(DisplaySample(target, floor.AddSeconds(-3), 1, false)); tracker.Observe(DisplaySample(target, floor.AddSeconds(-3), 2, false));
+            power.Invoke(controller, new object[] { null, new Microsoft.Win32.PowerModeChangedEventArgs(Microsoft.Win32.PowerModes.Suspend) });
+            DateTime resumed = (DateTime)typeof(NativeController).GetField("notificationFloorUtc", flags).GetValue(controller);
+            Check((long)typeof(NativeController).GetField("notificationEpoch", flags).GetValue(controller) == 8 && resumed >= floor && !(bool)deliver.Invoke(controller, new object[] { 7L, resumed.AddSeconds(1) }), "Suspend invalidates queued delivery and advances its observation floor");
+            Check(tracker.Observe(DisplaySample(target, resumed, 1, false)) == null && tracker.Observe(DisplaySample(target, resumed, 2, false)) == null && tracker.Observe(DisplaySample(target, resumed, 3, false)) != null, "Power mode change clears consecutive failure counts before monitoring continues");
+            power.Invoke(controller, new object[] { null, new Microsoft.Win32.PowerModeChangedEventArgs(Microsoft.Win32.PowerModes.Resume) });
+            Check(tracker.Observe(DisplaySample(target, resumed.AddSeconds(4), 1, true)) == null && tracker.Observe(DisplaySample(target, resumed.AddSeconds(4), 2, true)) == null, "Resume clears prior outage pairing so it cannot invent a recovery notification");
+            long epoch = (long)typeof(NativeController).GetField("notificationEpoch", flags).GetValue(controller);
+            typeof(NativeController).GetMethod("SetTrayMuted", flags).Invoke(controller, new object[] { true });
+            Check((long)typeof(NativeController).GetField("notificationEpoch", flags).GetValue(controller) == epoch + 1 && !(bool)deliver.Invoke(controller, new object[] { epoch, DateTime.UtcNow.AddSeconds(1) }), "Muting invalidates already queued alert callbacks");
+            var ending = (System.Windows.SessionEndingCancelEventArgs)FormatterServices.GetUninitializedObject(typeof(System.Windows.SessionEndingCancelEventArgs));
+            using (var source = new CancellationTokenSource())
+            {
+                typeof(NativeController).GetField("operation", flags).SetValue(controller, "repair"); typeof(NativeController).GetField("cancellation", flags).SetValue(controller, source);
+                typeof(NativeController).GetMethod("OnSessionEnding", flags).Invoke(controller, new object[] { null, ending });
+                Check(!ending.Cancel && !source.IsCancellationRequested && (bool)typeof(NativeController).GetField("sessionEnding", flags).GetValue(controller) && (bool)typeof(NativeController).GetField("exitRequested", flags).GetValue(controller), "Windows session end remains unblocked and does not cancel an active repair write token");
+                typeof(NativeController).GetField("operation", flags).SetValue(controller, "monitor");
+                typeof(NativeController).GetMethod("OnSessionEnding", flags).Invoke(controller, new object[] { null, ending });
+                Check(source.IsCancellationRequested && !ending.Cancel, "Windows session end cancels read-only monitoring without vetoing logoff");
+            }
+        }
+
+        private static void MonitoringHtmlSelectionChecks()
+        {
+            NativeController controller = UninitializedController(); BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
+            typeof(NativeController).GetField("mode", flags).SetValue(controller, "advanced");
+            var selected = new MonitoringHistoryRecord { Id = Guid.NewGuid().ToString("N") }; typeof(NativeController).GetField("selectedMonitoringHistory", flags).SetValue(controller, selected);
+            bool rejected = false;
+            try { ((Task)typeof(NativeController).GetMethod("Dispatch", flags).Invoke(controller, new object[] { new Dictionary<string, object> { { "command", "exportMonitoringHtml" }, { "id", Guid.NewGuid().ToString("N") } } })).GetAwaiter().GetResult(); } catch (InvalidDataException) { rejected = true; }
+            Check(rejected && typeof(NativeController).GetField("operation", flags).GetValue(controller) == null, "HTML export rejects a stale selected history id before report generation or any native dialog");
         }
 
         private static void MonitoringPersistenceFailureChecks()
@@ -692,7 +834,7 @@ namespace NetworkRescue
                 Interfaces = Enumerable.Range(0, 8).Select(delegate(int j) { return new WifiLinkSample { InterfaceId = Guid.NewGuid().ToString("D"), State = 1, Readability = "Available", SignalPercent = 100, RxKbps = 5400000, TxKbps = 5400000 }; }).ToArray() }; }).ToArray();
             typeof(MonitoringHistoryStore).GetMethod("Validate", BindingFlags.NonPublic | BindingFlags.Static).Invoke(null, new object[] { record, false });
             var serializer = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = NativeController.MaximumUiJsonLength, RecursionLimit = 32 };
-            string packet = serializer.Serialize(new { type = "monitorHistoryLoaded", targets = record.Targets, events = record.Events, wifiSamples = record.WifiSamples,
+            string packet = serializer.Serialize(new { type = "monitorHistoryLoaded", targets = record.Targets, events = record.Events, wifiSamples = record.WifiSamples, summary = NativeController.BuildMonitoringSummaryPreview(record),
                 series = targets.Select(delegate(MonitorTarget target) { return new { TargetId = target.Id, samples = record.Samples.Where(delegate(MonitorSample sample) { return sample.TargetId == target.Id; }).ToArray() }; }).ToArray() });
             Check(packet.Length > 4 * 1024 * 1024 && packet.Length < NativeController.MaximumUiJsonLength && serializer.DeserializeObject(packet) != null,
                 "Legal maximum combined monitoring evidence with JSON-escaped adapter names fits the bounded shared UI envelope without truncation");

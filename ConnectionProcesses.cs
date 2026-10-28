@@ -92,7 +92,7 @@ namespace NetworkRescue
                 || ex is EntryPointNotFoundException || ex is BadImageFormatException || ex is NotSupportedException || ex is SecurityException || ex is UnauthorizedAccessException;
         }
 
-        private static ConnectionProcessRow[] ReadFamily(bool ipv6)
+        internal static ConnectionProcessRow[] ReadFamily(bool ipv6)
         {
             int size = 0;
             uint status = GetExtendedTcpTable(IntPtr.Zero, ref size, false, ipv6 ? 23 : 2, 4, 0);

@@ -89,6 +89,11 @@ namespace NetworkRescue
             Assert(result.Timestamp == sampled && result.TotalRows == 601 && result.Rows.Length == 512 && result.Truncated && result.ErrorCode == null, "deduplicate before accurate total and bound output to 512");
             Assert(result.Rows[0].LocalPort == 65000 && result.Rows[0].State == "Established", "sort Established before truncation even when input tail");
             Assert(lookups == 1 && result.Rows.All(delegate(ConnectionProcessRow row) { return row.ProcessName == "fixture" && row.ProcessStatus == "PidNameSnapshot"; }), "cache a process identity once per retained PID");
+            rows = Enumerable.Range(1000, 512).Select(delegate(int port) { return Row(port, 1234, "Established"); }).ToList();
+            rows.Add(new ConnectionProcessRow { LocalAddress = "::1", RemoteAddress = "::1", LocalPort = 60000, RemotePort = 60001, State = "Established", ProcessId = 1234 });
+            rows.Add(new ConnectionProcessRow { LocalAddress = "::1", RemoteAddress = "::1", LocalPort = 60001, RemotePort = 60000, State = "Established", ProcessId = 1234 });
+            result = ConnectionProcesses.BuildSnapshot(rows, sampled, null, delegate(int pid, DateTime time) { return new ConnectionProcesses.ProcessIdentity { Name = "fixture", Status = "PidNameSnapshot" }; });
+            Assert(result.TotalRows == 514 && result.Rows.Length == 512 && result.Truncated && result.Rows.All(delegate(ConnectionProcessRow row) { return row.RemoteAddress != "::1"; }), "512 earlier sorted established rows may legitimately exclude live IPv6 endpoints from the public preview");
             rows = new List<ConnectionProcessRow> { Row(1, 12, "Established"), Row(2, 12, "Established"), Row(3, 13, "Established"), Row(4, 13, "Established"), Row(5, 14, "Established"), Row(6, 0, "TimeWait"), Row(7, null, "TimeWait") };
             lookups = 0;
             result = ConnectionProcesses.BuildSnapshot(rows, sampled, null, delegate(int pid, DateTime time)
@@ -160,19 +165,26 @@ namespace NetworkRescue
                     using (Process current = Process.GetCurrentProcess())
                     {
                         int clientPort = ((IPEndPoint)client.LocalEndPoint).Port, serverPort = ((IPEndPoint)server.LocalEndPoint).Port;
-                        ConnectionProcessSnapshot snapshot = null;
+                        ConnectionProcessSnapshot snapshot = null, publicSnapshot = null;
                         ConnectionProcessRow[] matching = new ConnectionProcessRow[0];
+                        Func<ConnectionProcessRow, bool> matchesEndpoints = delegate(ConnectionProcessRow row) { return row.LocalAddress == address.ToString() && row.RemoteAddress == address.ToString() && ((row.LocalPort == clientPort && row.RemotePort == serverPort) || (row.LocalPort == serverPort && row.RemotePort == clientPort)); };
                         for (int attempt = 0; attempt < 5; attempt++)
                         {
-                            snapshot = ConnectionProcesses.Capture();
-                            matching = snapshot.Rows.Where(delegate(ConnectionProcessRow row) { return row.LocalAddress == address.ToString() && row.RemoteAddress == address.ToString() && ((row.LocalPort == clientPort && row.RemotePort == serverPort) || (row.LocalPort == serverPort && row.RemotePort == clientPort)); }).ToArray();
+                            // Ownership is tested against the real native family table before the product's
+                            // intentionally bounded preview can omit these endpoints on a busy machine.
+                            DateTime sampled = DateTime.UtcNow;
+                            ConnectionProcessRow[] endpoints = ConnectionProcesses.ReadFamily(address.AddressFamily == AddressFamily.InterNetworkV6).Where(matchesEndpoints).ToArray();
+                            snapshot = ConnectionProcesses.BuildSnapshot(endpoints, sampled, null, ConnectionProcesses.ReadProcess);
+                            matching = snapshot.Rows;
+                            publicSnapshot = ConnectionProcesses.Capture();
                             if (matching.Length == 2) break;
                             Thread.Sleep(20);
                         }
-                        Assert(matching.Length == 2, "native snapshot contains both live loopback endpoints " + address);
+                        Assert(matching.Length == 2, "native family table contains both live loopback endpoints " + address);
                         Assert(matching.All(delegate(ConnectionProcessRow row) { return row.State == "Established" && row.ProcessId == current.Id && row.ProcessName == current.ProcessName && row.ProcessStatus == "PidNameSnapshot"; }), "live socket ownership resolves to this process and PID " + address);
-                        Assert(snapshot.Timestamp.Kind == DateTimeKind.Utc && snapshot.Rows.Length <= 512 && snapshot.TotalRows >= snapshot.Rows.Length && snapshot.Truncated == (snapshot.TotalRows > 512), "live snapshot preserves UTC sampling and output bounds");
-                        Console.WriteLine("Loopback " + address + ": PID=" + current.Id + ", Process=" + current.ProcessName + ", matched=" + matching.Length + ", total=" + snapshot.TotalRows);
+                        Assert(publicSnapshot.Timestamp.Kind == DateTimeKind.Utc && publicSnapshot.Rows.Length <= 512 && publicSnapshot.TotalRows >= publicSnapshot.Rows.Length && publicSnapshot.Truncated == (publicSnapshot.TotalRows > 512), "public live snapshot preserves UTC sampling and output bounds");
+                        Assert(publicSnapshot.Truncated || publicSnapshot.Rows.Count(matchesEndpoints) == 2, "an untruncated public snapshot must contain both live endpoints " + address);
+                        Console.WriteLine("Loopback " + address + ": PID=" + current.Id + ", Process=" + current.ProcessName + ", matched=" + matching.Length + ", total=" + publicSnapshot.TotalRows + ", publicMatched=" + publicSnapshot.Rows.Count(matchesEndpoints) + ", truncated=" + publicSnapshot.Truncated);
                     }
                 }
             }

@@ -5,6 +5,7 @@
 /build-native-x86/
 /build-history-checks/
 /build-wifi-checks/
+/build-summary-checks/
 /packages/
 /dist/
 /.vs/

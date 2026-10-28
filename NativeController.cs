@@ -11,6 +11,9 @@ using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using System.Windows.Interop;
+using SystemEvents = Microsoft.Win32.SystemEvents;
+using PowerModeChangedEventArgs = Microsoft.Win32.PowerModeChangedEventArgs;
+using PowerModes = Microsoft.Win32.PowerModes;
 using IWin32Window = System.Windows.Forms.IWin32Window;
 
 namespace NetworkRescue
@@ -22,6 +25,13 @@ namespace NetworkRescue
         private readonly RepairHistoryStore history = new RepairHistoryStore();
         private readonly MonitoringHistoryStore monitoringHistory = new MonitoringHistoryStore();
         private MonitoringHistoryRecord selectedMonitoringHistory;
+        private TrayMonitor tray;
+        private readonly MonitorAlertTracker alerts = new MonitorAlertTracker();
+        private readonly object alertGate = new object();
+        private bool trayEnabled, trayMuted, exitRequested, sessionEnding, powerEventsSubscribed;
+        private long notificationEpoch;
+        private DateTime notificationFloorUtc = DateTime.MinValue;
+        private System.Windows.Application hostApplication;
         // Structured evidence can exceed the old limit; keep the sender bounded to the native view's limit.
         internal const int MaximumUiJsonLength = 8 * 1024 * 1024;
         private readonly JavaScriptSerializer json = new JavaScriptSerializer { MaxJsonLength = MaximumUiJsonLength, RecursionLimit = 32 };
@@ -43,7 +53,7 @@ namespace NetworkRescue
         private MonitoringSession monitoring;
         private NetworkChangeSnapshot healthyConfiguration;
         private DiagnosticReport healthyReport;
-        internal const string DisplayVersion = "1.2.0";
+        internal const string DisplayVersion = "1.3.0";
         internal sealed class MonitoringSession
         {
             internal readonly object Sync = new object();
@@ -52,6 +62,7 @@ namespace NetworkRescue
             internal readonly MonitorTarget[] Targets;
             internal readonly Dictionary<string, Queue<MonitorSample>> Samples = new Dictionary<string, Queue<MonitorSample>>(StringComparer.Ordinal);
             internal readonly List<MonitorSample> ArchiveSamples = new List<MonitorSample>();
+            private readonly Dictionary<string, MonitoringDisplayStats> displayStats = new Dictionary<string, MonitoringDisplayStats>(StringComparer.Ordinal);
             internal readonly Queue<WifiStabilitySample> WifiSamples = new Queue<WifiStabilitySample>();
             internal int WifiTotalSamples;
             internal readonly NetworkChangeTracker Changes = new NetworkChangeTracker();
@@ -67,17 +78,99 @@ namespace NetworkRescue
                 Targets = targets;
                 foreach (MonitorTarget target in targets) Samples.Add(target.Id, new Queue<MonitorSample>());
             }
-            internal void Append(MonitorSample sample)
+            internal MonitorSample Append(MonitorSample sample)
             {
                 lock (Sync)
                 {
                     Queue<MonitorSample> series;
-                    if (!Samples.TryGetValue(sample.TargetId ?? "", out series)) return;
+                    if (!Samples.TryGetValue(sample.TargetId ?? "", out series)) return null;
                     series.Enqueue(sample);
                     if (series.Count > 300) series.Dequeue();
                     if (ArchiveSamples.Count < 14400) ArchiveSamples.Add(sample);
+                    MonitoringDisplayStats stats;
+                    if (!displayStats.TryGetValue(sample.TargetId, out stats)) displayStats.Add(sample.TargetId, stats = new MonitoringDisplayStats());
+                    return stats.Project(sample, IntervalMs);
                 }
             }
+        }
+        private sealed class MonitoringDisplayStats
+        {
+            private int sent, received, latencyCount, jitterCount, previousSequence;
+            private double total, jitterTotal;
+            private double? min, max;
+            private long? previousRtt;
+            private DateTime previousTime;
+            internal MonitorSample Project(MonitorSample sample, int intervalMs)
+            {
+                // Producer counters include attempts discarded across suspend/resume. Keep the raw
+                // archive intact for schema 2, and project only retained observations for every view.
+                bool measured = !MonitoringSummaryBuilder.IsUnmeasuredSample(sample);
+                bool http = String.Equals(sample.Method, "HTTPS", StringComparison.OrdinalIgnoreCase) || String.Equals(sample.Method, "HTTP", StringComparison.OrdinalIgnoreCase);
+                bool response = measured && (http ? sample.ResponseReceived : sample.Success);
+                long maximumSpacing = Math.Max(2L * intervalMs, intervalMs + (http ? 3000L : 1200L));
+                if (!measured || sample.Sequence != previousSequence + 1 || (sample.TimeUtc - previousTime).TotalMilliseconds > maximumSpacing) previousRtt = null;
+                if (measured) sent++;
+                if (response)
+                {
+                    received++;
+                    if (sample.RttMs.HasValue)
+                    {
+                        long rtt = sample.RttMs.Value;
+                        latencyCount++; total += rtt;
+                        min = min.HasValue ? Math.Min(min.Value, rtt) : rtt;
+                        max = max.HasValue ? Math.Max(max.Value, rtt) : rtt;
+                        if (previousRtt.HasValue) { jitterTotal += Math.Abs(rtt - previousRtt.Value); jitterCount++; }
+                        previousRtt = rtt;
+                    }
+                    else previousRtt = null;
+                }
+                else previousRtt = null;
+                previousSequence = sample.Sequence; previousTime = sample.TimeUtc;
+                return new MonitorSample { TargetId = sample.TargetId, TargetHost = sample.TargetHost, Sequence = sample.Sequence, TimeUtc = sample.TimeUtc,
+                    Success = measured && sample.Success, ResponseReceived = measured && sample.ResponseReceived, HttpSuccess = measured && sample.HttpSuccess,
+                    RttMs = measured ? sample.RttMs : null, Method = sample.Method, Route = sample.Route, ResolvedAddress = sample.ResolvedAddress,
+                    Status = sample.Status, ErrorCode = measured ? sample.ErrorCode : null, HttpStatusCode = measured ? sample.HttpStatusCode : null,
+                    Sent = sent, Received = received, LossPercent = sent == 0 ? 0 : 100.0 * (sent - received) / sent,
+                    Min = min, Avg = latencyCount == 0 ? (double?)null : total / latencyCount, Max = max, JitterMs = jitterCount == 0 ? (double?)null : jitterTotal / jitterCount };
+            }
+        }
+
+        internal static MonitorSample[] BuildMonitoringDisplaySamples(MonitorSample[] samples, int intervalMs)
+        {
+            var stats = new Dictionary<string, MonitoringDisplayStats>(StringComparer.Ordinal);
+            return samples.Select(delegate(MonitorSample sample) {
+                MonitoringDisplayStats target;
+                if (!stats.TryGetValue(sample.TargetId, out target)) stats.Add(sample.TargetId, target = new MonitoringDisplayStats());
+                return target.Project(sample, intervalMs);
+            }).ToArray();
+        }
+
+        internal static object[] BuildMonitoringDisplaySeries(MonitorTarget[] targets, MonitorSample[] samples, int intervalMs)
+        {
+            MonitorSample[] projected = BuildMonitoringDisplaySamples(samples, intervalMs);
+            return targets.Select(delegate(MonitorTarget target) {
+                MonitorSample[] points = projected.Where(delegate(MonitorSample sample) { return sample.TargetId == target.Id; }).ToArray();
+                return (object)new { TargetId = target.Id, samples = points.Skip(Math.Max(0, points.Length - 300)).ToArray() };
+            }).ToArray();
+        }
+
+        internal static MultiMonitorSummary BuildMonitoringFinal(MonitorTarget[] targets, MonitorSample[] samples, int intervalMs, DateTime started, DateTime ended, MultiMonitorSummary producer = null)
+        {
+            MonitorSample[] projected = BuildMonitoringDisplaySamples(samples, intervalMs);
+            return new MultiMonitorSummary { StartedUtc = started, EndedUtc = ended, Targets = targets.Select(delegate(MonitorTarget target) {
+                MonitorSample latest = projected.LastOrDefault(delegate(MonitorSample sample) { return sample.TargetId == target.Id && !MonitoringSummaryBuilder.IsUnmeasuredSample(sample); });
+                bool http = target.Method == "https";
+                if (latest == null) latest = new MonitorSample { Status = "NotMeasured", Method = http ? "HTTPS" : "ICMP", Route = http ? target.UseSystemProxy ? "WindowsProxy" : "Direct" : "Network" };
+                MonitorSummary source = producer == null ? null : producer.Targets.FirstOrDefault(delegate(MonitorSummary item) { return item.TargetId == target.Id; });
+                string resolutionError = source != null && source.Sent == 0 && source.ErrorCode != null && source.ErrorCode.StartsWith("Resolve", StringComparison.Ordinal) ? source.ErrorCode : null;
+                return new MonitorSummary { TargetId = target.Id, TargetHost = target.Host, Host = target.Host, StartedUtc = started, EndedUtc = ended,
+                    Sequence = latest.Sequence, TimeUtc = latest.TimeUtc, Sent = latest.Sent, Received = latest.Received, LossPercent = latest.LossPercent,
+                    Success = latest.Received > 0, ResponseReceived = http && latest.Received > 0,
+                    HttpSuccess = http && latest.Sent > 0 && projected.Where(delegate(MonitorSample sample) { return sample.TargetId == target.Id && !MonitoringSummaryBuilder.IsUnmeasuredSample(sample); }).All(delegate(MonitorSample sample) { return sample.HttpSuccess; }),
+                    RttMs = latest.RttMs, Min = latest.Min, Avg = latest.Avg, Max = latest.Max, JitterMs = latest.JitterMs,
+                    Status = latest.Sent == 0 ? "NotMeasured" : http ? latest.Received == latest.Sent ? "HttpResponding" : latest.Received > 0 ? "HttpPartialResponse" : "HttpNoResponse" : latest.Received == latest.Sent ? "Responding" : latest.Received > 0 ? "PartialResponse" : "NoIcmpResponse",
+                    ErrorCode = latest.ErrorCode ?? resolutionError, HttpStatusCode = latest.HttpStatusCode, Method = latest.Method, Route = latest.Route, ResolvedAddress = latest.ResolvedAddress };
+            }).ToArray() };
         }
         private sealed class WindowOwner : IWin32Window
         {
@@ -91,6 +184,14 @@ namespace NetworkRescue
             ReadSettings();
             SoftDialog.SetTheme(theme);
             if (forcedLanguage != null) { I18n.SetLanguage(forcedLanguage); ReadUi(); }
+            tray = new TrayMonitor(view.Dispatcher, U, ShowFromTray,
+                delegate { if (operation == "monitor" && cancellation != null) cancellation.Cancel(); },
+                delegate(bool muted) { SetTrayMuted(muted); }, RequestExit);
+            try { SystemEvents.PowerModeChanged += OnPowerModeChanged; powerEventsSubscribed = true; }
+            catch (InvalidOperationException) { }
+            catch (System.Runtime.InteropServices.ExternalException) { }
+            hostApplication = System.Windows.Application.Current;
+            if (hostApplication != null) hostApplication.SessionEnding += OnSessionEnding;
             view.CommandRequested += async delegate(string command, Dictionary<string, object> values)
             {
                 try
@@ -105,10 +206,18 @@ namespace NetworkRescue
             };
             view.Closing += delegate(object sender, System.ComponentModel.CancelEventArgs e)
             {
+                if (sessionEnding) return;
                 if (operation == "repair")
                 {
+                    exitRequested = false;
                     e.Cancel = true;
                     SoftDialog.Show(DialogOwner, U("native.operationActive"), U("native.resultTitle"), MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                else if (ShouldHideOnClose(trayEnabled, operation, exitRequested))
+                {
+                    e.Cancel = true;
+                    view.Hide();
+                    EmitTrayState();
                 }
                 else if (cancellation != null)
                 {
@@ -116,8 +225,140 @@ namespace NetworkRescue
                     if (operation == "monitor" && monitoring != null) SaveMonitoringCheckpoint(monitoring, "Stopped");
                 }
             };
-            view.Closed += delegate { closed = true; if (cancellation != null) cancellation.Cancel(); };
+            view.Closed += delegate
+            {
+                closed = true; if (operation != "repair" && cancellation != null) cancellation.Cancel();
+                if (tray != null) tray.Dispose();
+                if (powerEventsSubscribed) SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+                if (hostApplication != null) hostApplication.SessionEnding -= OnSessionEnding;
+            };
         }
+        internal static bool AllowsTrayCommand(string command, string activeOperation)
+        {
+            return command == "exitApplication" || (activeOperation == "monitor" && (command == "setTray" || command == "setTrayMuted" || command == "hideToTray"));
+        }
+
+        internal static bool ShouldHideOnClose(bool enabled, string activeOperation, bool requestedExit)
+        {
+            return enabled && activeOperation == "monitor" && !requestedExit;
+        }
+
+        private void ShowFromTray()
+        {
+            if (closed) return;
+            view.Show();
+            if (view.WindowState == System.Windows.WindowState.Minimized) view.WindowState = System.Windows.WindowState.Normal;
+            view.Activate(); EmitTrayState();
+        }
+
+        private void RequestExit()
+        {
+            exitRequested = true;
+            view.Close();
+            if (!closed) { exitRequested = false; EmitTrayState(); }
+        }
+
+        private void EmitTrayState()
+        {
+            Emit(new { type = "trayState", enabled = trayEnabled, muted = trayMuted, monitoring = operation == "monitor" && monitoring != null && monitoring.EndedUtc == default(DateTime), hidden = view != null && !view.IsVisible });
+        }
+
+        private void SetTrayEnabled(bool enabled)
+        {
+            // Create the shell icon before committing the mode; a failed icon cannot strand a hidden window.
+            if (tray != null) tray.SetEnabled(enabled);
+            trayEnabled = enabled;
+            ResetMonitorAlerts();
+            if (!enabled && view != null && !view.IsVisible) ShowFromTray();
+            EmitTrayState();
+        }
+
+        private void SetTrayMuted(bool muted)
+        {
+            bool changed = muted != trayMuted;
+            trayMuted = muted;
+            if (tray != null) tray.SetMuted(muted);
+            if (alerts != null && alertGate != null) lock (alertGate) { if (changed && muted) { alerts.ResetContinuity(); notificationEpoch++; } alerts.SetMuted(muted); }
+            EmitTrayState();
+        }
+
+        private void ResetMonitorAlerts()
+        {
+            if (alerts == null || alertGate == null) return;
+            lock (alertGate)
+            {
+                notificationEpoch++;
+                if (trayEnabled && operation == "monitor" && monitoring != null) alerts.BeginSession(monitoring.Targets.Select(delegate(MonitorTarget t) { return t.Id; }), monitoring.IntervalMs);
+                else alerts.Stop();
+                alerts.SetMuted(trayMuted);
+            }
+            if (tray != null) { tray.SetMuted(trayMuted); tray.SetMonitoring(operation == "monitor"); }
+        }
+
+        private void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
+        {
+            if (e.Mode != PowerModes.Suspend && e.Mode != PowerModes.Resume) return;
+            lock (alertGate)
+            {
+                notificationFloorUtc = DateTime.UtcNow;
+                notificationEpoch++;
+                alerts.ResetContinuity();
+            }
+        }
+
+        private bool IsObservationCurrent(DateTime timeUtc)
+        {
+            if (alertGate == null) return true;
+            lock (alertGate) return timeUtc >= notificationFloorUtc;
+        }
+
+        private bool IsAlertDeliveryCurrent(long epoch, DateTime timeUtc)
+        {
+            if (alertGate == null) return false;
+            lock (alertGate) return epoch == notificationEpoch && timeUtc >= notificationFloorUtc && trayEnabled && !trayMuted;
+        }
+
+        private void OnSessionEnding(object sender, System.Windows.SessionEndingCancelEventArgs e)
+        {
+            // Respect Windows session end; do not turn a logoff/shutdown into a hidden background window.
+            exitRequested = true;
+            sessionEnding = true;
+            if (operation != "repair" && cancellation != null) cancellation.Cancel();
+            if (operation == "monitor" && monitoring != null) SaveMonitoringCheckpoint(monitoring, "Stopped");
+        }
+
+        private MonitoringHistoryRecord SelectedMonitoringRecord(string id)
+        {
+            if (id.Length > 0 && (selectedMonitoringHistory == null || selectedMonitoringHistory.Id != id)) throw new InvalidDataException(U("monitorHistoryMissing"));
+            if (selectedMonitoringHistory != null) return selectedMonitoringHistory;
+            return monitoring == null ? null : CaptureMonitoringRecord(monitoring, monitoring.HistoryState);
+        }
+
+        internal static object BuildMonitoringSummaryPreview(MonitoringHistoryRecord record)
+        {
+            MonitoringSessionSummary summary = MonitoringSummaryBuilder.Build(record);
+            var shownIntervals = new HashSet<MonitoringNoResponseInterval>(summary.Targets.SelectMany(delegate(MonitoringTargetSummary t) { return t.Intervals; }).OrderBy(delegate(MonitoringNoResponseInterval i) { return i.StartUtc; }).Take(200));
+            var shownGaps = new HashSet<MonitoringSamplingGap>(summary.Targets.SelectMany(delegate(MonitoringTargetSummary t) { return t.Gaps; }).OrderBy(delegate(MonitoringSamplingGap g) { return g.StartUtc; }).Take(200));
+            return new { summary.TotalIntervals, summary.GapCount, Truncated = summary.TotalIntervals > shownIntervals.Count || summary.GapCount > shownGaps.Count,
+                summary.EventsTruncated, summary.WifiTruncated,
+                Targets = summary.Targets.Select(delegate(MonitoringTargetSummary target) { return new { target.TargetId, target.Host, target.Method, target.SampleCount, target.ResponseCount,
+                    TotalIntervals = target.Intervals.Length, GapCount = target.Gaps.Length,
+                    Intervals = target.Intervals.Where(shownIntervals.Contains).ToArray(), Gaps = target.Gaps.Where(shownGaps.Contains).ToArray() }; }).ToArray() };
+        }
+
+        private void ExportMonitoringHtml(MonitoringHistoryRecord record)
+        {
+            HtmlReportDocument document = MonitoringHtmlReport.Build(record, U);
+            if (SoftDialog.Show(DialogOwner, document.PreviewText, U("htmlReportPreviewTitle"), MessageBoxButtons.OKCancel, MessageBoxIcon.Information, MessageBoxDefaultButton.Button2) != DialogResult.OK) return;
+            using (var dialog = new SaveFileDialog { Title = U("htmlReportSaveTitle"), Filter = "HTML (*.html)|*.html", DefaultExt = "html", AddExtension = true,
+                FileName = "NetworkRescue-monitoring-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".html", OverwritePrompt = true })
+            {
+                if (dialog.ShowDialog(DialogOwner) != DialogResult.OK) return;
+                File.WriteAllText(dialog.FileName, document.Html, new UTF8Encoding(false));
+                Emit("notice", U("native.saveSuccess"));
+            }
+        }
+
         private async Task Dispatch(Dictionary<string, object> message)
         {
             string command = TextValue(message, "command", 32);
@@ -134,16 +375,23 @@ namespace NetworkRescue
                 return;
             }
             if (command == "cancel") { if (operation != "repair" && cancellation != null) cancellation.Cancel(); return; }
-            if (!String.IsNullOrEmpty(operation)) { Emit("notice", U("native.busy")); return; }
+            if (!String.IsNullOrEmpty(operation) && !AllowsTrayCommand(command, operation)) { Emit("notice", U("native.busy")); return; }
             switch (command)
             {
+                case "setTray":
+                    RequireAdvanced(); SetTrayEnabled(BoolValue(message, "enabled")); break;
+                case "setTrayMuted": SetTrayMuted(BoolValue(message, "muted")); break;
+                case "hideToTray":
+                    if (trayEnabled && operation == "monitor") { view.Hide(); EmitTrayState(); }
+                    break;
+                case "exitApplication": RequestExit(); break;
                 case "setMode":
                     string newMode = TextValue(message, "mode", 12);
                     if (newMode != "beginner" && newMode != "advanced") throw new InvalidDataException(U("native.invalidMessage"));
                     mode = newMode; SaveSettings(); SendInit(); break;
                 case "setLanguage":
                     I18n.SetLanguage(TextValue(message, "language", 12));
-                    ReadUi(); SaveSettings(); report = null; siteReport = null; SendInit();
+                    ReadUi(); SaveSettings(); report = null; siteReport = null; if (tray != null) tray.RefreshText(); SendInit();
                     Emit(new { type = "report", report = (object)null }); SendHistory(); break;
                 case "setTheme":
                     string selectedTheme = TextValue(message, "theme", 12);
@@ -190,6 +438,16 @@ namespace NetworkRescue
                     if (selectedMonitoringHistory != null) { SaveRedactedReport(BuildMonitoringRecordText(selectedMonitoringHistory, U)); break; }
                     if (monitoring == null) { Emit("notice", U("native.notReady")); break; }
                     SaveRedactedReport(BuildMonitoringText(monitoring, U)); break;
+                case "monitoringSummary":
+                    RequireAdvanced();
+                    MonitoringHistoryRecord summaryRecord = SelectedMonitoringRecord(OptionalText(message, "id", 32));
+                    if (summaryRecord != null) Emit(new { type = "monitorSummary", summary = BuildMonitoringSummaryPreview(summaryRecord) });
+                    break;
+                case "exportMonitoringHtml":
+                    RequireAdvanced();
+                    MonitoringHistoryRecord htmlRecord = SelectedMonitoringRecord(OptionalText(message, "id", 32));
+                    if (htmlRecord == null) { Emit("notice", U("native.notReady")); break; }
+                    ExportMonitoringHtml(htmlRecord); break;
                 case "checkUpdates":
                     string source = UpdateService.RepositoryOrDefault(OptionalText(message, "repository", 160)), normalized;
                     if (!UpdateService.TryNormalizeRepository(source, out normalized)) throw new InvalidDataException(U("updateRepositoryHint"));
@@ -439,6 +697,7 @@ namespace NetworkRescue
             MonitoringSession session = new MonitoringSession(targets) { IntervalMs = interval, RequestedCount = count };
             monitoring = session;
             selectedMonitoringHistory = null;
+            ResetMonitorAlerts(); EmitTrayState();
             long run = generation;
             Emit(new { type = "monitorStarted", targets = targets, startedUtc = session.StartedUtc, wifiSupported = true });
             Emit(new { type = "networkChange", @event = session.Changes.Record("MonitoringStarted", session.StartedUtc) });
@@ -450,18 +709,29 @@ namespace NetworkRescue
                 Task wifiWatcher = ObserveWifiAsync(session, delegate(WifiStabilitySample sample, int total)
                 {
                     PostForRun(run, delegate { Emit(new { type = "wifiSample", sample = sample, totalSamples = total, truncated = total > 720 }); });
-                }, observe.Token, WifiStabilityReader.Capture);
+                }, observe.Token, WifiStabilityReader.Capture, IsObservationCurrent);
                 System.Runtime.ExceptionServices.ExceptionDispatchInfo failure = null;
+                MultiMonitorSummary producerFinal = null;
                 try
                 {
                     var updates = new DirectProgress<MonitorSample>(delegate(MonitorSample sample)
                     {
-                        session.Append(sample);
+                        MonitorAlert alert = null;
+                        long alertEpoch = 0;
+                        if (alertGate != null) lock (alertGate)
+                        {
+                            // An in-flight probe crossing suspend/resume is not evidence of a network failure.
+                            if (sample.TimeUtc < notificationFloorUtc) return;
+                            if (trayEnabled && alerts != null) alert = alerts.Observe(sample);
+                            alertEpoch = notificationEpoch;
+                        }
+                        MonitorSample displaySample = session.Append(sample);
                         NetworkChangeEvent[] changes = session.Changes.ObserveSample(sample);
                         PostForRun(run, delegate
                         {
-                            Emit(new { type = "monitorSample", sample = sample });
+                            Emit(new { type = "monitorSample", sample = displaySample });
                             foreach (NetworkChangeEvent change in changes) Emit(new { type = "networkChange", @event = change });
+                            if (alert != null && IsAlertDeliveryCurrent(alertEpoch, alert.TimeUtc) && operation == "monitor" && monitoring == session && session.EndedUtc == default(DateTime) && tray != null) tray.NotifyAlert(alert);
                         });
                         bool checkpoint;
                         lock (session.Sync)
@@ -471,8 +741,7 @@ namespace NetworkRescue
                         }
                         if (checkpoint) SaveMonitoringCheckpoint(session, "Running");
                     });
-                    session.Final = await NetworkMonitor.RunTargetsAsync(targets, interval, count, updates, token);
-                    Emit(new { type = "monitorResult", result = session.Final });
+                    producerFinal = await NetworkMonitor.RunTargetsAsync(targets, interval, count, updates, token);
                 }
                 catch (Exception ex)
                 {
@@ -486,15 +755,22 @@ namespace NetworkRescue
                 try { await wifiWatcher; } catch (OperationCanceledException) { }
                 catch (Exception ex) { session.Failed = true; if (failure == null) failure = System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex); }
                 session.EndedUtc = DateTime.UtcNow;
+                lock (session.Sync) session.Final = BuildMonitoringFinal(targets, session.ArchiveSamples.ToArray(), interval, session.StartedUtc, session.EndedUtc, producerFinal);
+                Emit(new { type = "monitorResult", result = session.Final });
                 NetworkChangeEvent ended = session.Changes.Record(session.Cancelled || session.Failed ? "MonitoringStopped" : "MonitoringCompleted", session.EndedUtc);
                 Emit(new { type = "networkChange", @event = ended });
                 SaveMonitoringCheckpoint(session, session.Failed ? "Failed" : session.Cancelled ? "Stopped" : "Completed");
                 object[] series;
-                lock (session.Sync) series = targets.Select(delegate(MonitorTarget target) { return (object)new { TargetId = target.Id, samples = session.Samples[target.Id].ToArray() }; }).ToArray();
+                lock (session.Sync) series = BuildMonitoringDisplaySeries(targets, session.ArchiveSamples.ToArray(), interval);
                 WifiStabilitySample[] wifi;
                 lock (session.Sync) wifi = WifiStabilityReader.Clone(session.WifiSamples.ToArray());
+                object summary = BuildMonitoringSummaryPreview(CaptureMonitoringRecord(session, session.HistoryState));
                 Emit(new { type = "monitorEnded", cancelled = session.Cancelled, failed = session.Failed, totalEvents = session.Changes.TotalEvents, truncated = session.Changes.TotalEvents > NetworkChangeTracker.MaximumEvents, events = session.Changes.RecentEvents, series = series,
-                    wifiSupported = true, wifiSamples = wifi, wifiTotalSamples = session.WifiTotalSamples, wifiTruncated = session.WifiTotalSamples > wifi.Length });
+                    wifiSupported = true, wifiSamples = wifi, wifiTotalSamples = session.WifiTotalSamples, wifiTruncated = session.WifiTotalSamples > wifi.Length, summary = summary });
+                Emit(new { type = "monitorSummary", summary = summary });
+                if (alerts != null && alertGate != null) lock (alertGate) { alerts.Stop(); notificationEpoch++; }
+                if (tray != null) tray.NotifySessionEnded(session.Failed, session.Cancelled);
+                EmitTrayState();
                 SendMonitoringHistory();
                 if (failure != null) failure.Throw();
             }
@@ -549,27 +825,29 @@ namespace NetworkRescue
             selectedMonitoringHistory = record;
             Emit(new { type = "monitorHistoryLoaded", id = record.Id, startedUtc = record.StartedUtc, endedUtc = record.EndedUtc,
                 state = record.State, intervalMs = record.IntervalMs, targets = record.Targets,
-                series = record.Targets.Select(delegate(MonitorTarget target) { MonitorSample[] points = record.Samples.Where(delegate(MonitorSample sample) { return sample.TargetId == target.Id; }).ToArray(); return new { TargetId = target.Id, samples = points.Skip(Math.Max(0, points.Length - 300)).ToArray() }; }).ToArray(),
+                series = BuildMonitoringDisplaySeries(record.Targets, record.Samples, record.IntervalMs),
                 events = record.Events, totalEvents = record.TotalEvents, truncated = record.EventsTruncated,
-                wifiSupported = record.WifiCollectionEnabled, wifiSamples = record.WifiSamples, wifiTotalSamples = record.WifiTotalSamples, wifiTruncated = record.WifiTruncated });
+                wifiSupported = record.WifiCollectionEnabled, wifiSamples = record.WifiSamples, wifiTotalSamples = record.WifiTotalSamples, wifiTruncated = record.WifiTruncated,
+                summary = BuildMonitoringSummaryPreview(record) });
+            Emit(new { type = "monitorSummary", summary = BuildMonitoringSummaryPreview(record) });
         }
 
         internal static object BuildMonitoringReplay(MonitoringHistoryRecord record, int sequence)
         {
+            MonitorSample[] projected = BuildMonitoringDisplaySamples(record.Samples, record.IntervalMs);
             NetworkChangeEvent selected = record.Events.FirstOrDefault(delegate(NetworkChangeEvent change) { return change.Sequence == sequence; });
             if (selected == null) throw new InvalidDataException("MonitoringHistoryEventMissing");
             double seconds = selected.Kind == "SettingChanged" ? 10 : Math.Max(2, record.IntervalMs / 1000.0);
             long? duration = null; bool recovered = false;
             if (selected.Kind == "TargetNoResponse")
             {
-                NetworkChangeEvent recovery = record.Events.FirstOrDefault(delegate(NetworkChangeEvent change) { return change.Kind == "TargetRecovered" && change.TargetId == selected.TargetId && change.TimeUtc >= selected.TimeUtc; });
-                recovered = recovery != null;
-                duration = Math.Max(0, (long)((recovery == null ? record.EndedUtc : recovery.TimeUtc) - selected.TimeUtc).TotalMilliseconds);
+                MonitoringNoResponseInterval interval = MonitoringSummaryBuilder.Build(record).Targets.SelectMany(delegate(MonitoringTargetSummary target) { return target.Intervals; }).FirstOrDefault(delegate(MonitoringNoResponseInterval item) { return item.EventSequence == selected.Sequence; });
+                if (interval != null) { recovered = interval.RecoveredUtc.HasValue; duration = interval.ObservedDurationMs; }
             }
             return new { type = "monitorHistoryReplay", id = record.Id, sequence = sequence, durationMs = duration, recovered = recovered,
                 wifiSupported = record.WifiCollectionEnabled, wifiSamples = record.WifiSamples.Where(delegate(WifiStabilitySample wifi) { return Math.Abs((wifi.TimeUtc - selected.TimeUtc).TotalSeconds) <= 10; }).ToArray(), wifiTotalSamples = record.WifiTotalSamples, wifiTruncated = record.WifiTruncated,
                 series = record.Targets.Select(delegate(MonitorTarget target) { return new { TargetId = target.Id,
-                    samples = record.Samples.Where(delegate(MonitorSample sample) { return sample.TargetId == target.Id && Math.Abs((sample.TimeUtc - selected.TimeUtc).TotalSeconds) <= seconds; }).ToArray() }; }).ToArray() };
+                    samples = projected.Where(delegate(MonitorSample sample) { return sample.TargetId == target.Id && Math.Abs((sample.TimeUtc - selected.TimeUtc).TotalSeconds) <= seconds; }).ToArray() }; }).ToArray() };
         }
 
         private void ReplayMonitoring(string id, int sequence)
@@ -586,10 +864,13 @@ namespace NetworkRescue
             output.AppendLine(record.StartedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") + " → " + record.EndedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"));
             output.AppendLine(text("monitorHistoryState" + record.State));
             output.AppendLine(text("monitorHistoryPrivacy"));
+            MultiMonitorSummary final = BuildMonitoringFinal(record.Targets, record.Samples, record.IntervalMs, record.StartedUtc, record.EndedUtc);
             foreach (MonitorTarget target in record.Targets)
             {
                 output.AppendLine();
                 output.AppendLine(target.Id + " · " + target.Host + " · " + target.Method + " · " + text(target.Method == "icmp" ? "monitorIcmp" : target.UseSystemProxy ? "monitorProxyFollow" : "monitorProxyDirect"));
+                MonitorSummary latest = final.Targets.First(delegate(MonitorSummary item) { return item.TargetId == target.Id; });
+                output.AppendLine(text("monitorSent") + ": " + latest.Received + "/" + latest.Sent + " · " + text("monitorAvg") + ": " + (latest.Avg.HasValue ? latest.Avg.Value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) : "—") + " ms · " + latest.Status + " · " + latest.ErrorCode);
                 foreach (MonitorSample sample in record.Samples.Where(delegate(MonitorSample point) { return point.TargetId == target.Id; }))
                     output.AppendLine(sample.TimeUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss.fff") + " · " + sample.Sequence + " · " + sample.Status + " · " + (sample.RttMs.HasValue ? sample.RttMs.Value.ToString(System.Globalization.CultureInfo.InvariantCulture) : "—") + " ms · HTTP " + sample.HttpStatusCode + " · " + sample.ErrorCode);
             }
@@ -627,7 +908,7 @@ namespace NetworkRescue
             }
         }
 
-        internal static async Task ObserveWifiAsync(MonitoringSession session, Action<WifiStabilitySample, int> publish, CancellationToken token, Func<WifiStabilitySample> capture)
+        internal static async Task ObserveWifiAsync(MonitoringSession session, Action<WifiStabilitySample, int> publish, CancellationToken token, Func<WifiStabilitySample> capture, Func<DateTime, bool> isCurrent = null)
         {
             Task<WifiStabilitySample> pending = null;
             bool stale = false;
@@ -658,6 +939,7 @@ namespace NetworkRescue
                         sample = new WifiStabilitySample { TimeUtc = DateTime.UtcNow, StateCode = "Unavailable", ErrorCode = "Timeout" };
                     }
                     if (sample == null) sample = new WifiStabilitySample { TimeUtc = DateTime.UtcNow, StateCode = "Unavailable", ErrorCode = "ReadUnavailable" };
+                    if (isCurrent != null && !isCurrent(sample.TimeUtc)) { await Task.Delay(Math.Max(1, 5000 - (int)clock.ElapsedMilliseconds), token).ConfigureAwait(false); continue; }
                     int total;
                     lock (session.Sync)
                     {
@@ -715,11 +997,11 @@ namespace NetworkRescue
             output.AppendLine(text("monitorSessionPrivacy"));
             lock (session.Sync)
             {
+                MultiMonitorSummary final = BuildMonitoringFinal(session.Targets, session.ArchiveSamples.ToArray(), session.IntervalMs, session.StartedUtc, session.EndedUtc, session.Final);
                 foreach (MonitorTarget target in session.Targets)
                 {
-                    MonitorSample latest = session.Final == null ? null : session.Final.Targets.FirstOrDefault(delegate(MonitorSummary result) { return result.TargetId == target.Id; });
+                    MonitorSample latest = final.Targets.FirstOrDefault(delegate(MonitorSummary result) { return result.TargetId == target.Id; });
                     Queue<MonitorSample> samples = session.Samples[target.Id];
-                    if (latest == null) latest = samples.LastOrDefault();
                     output.AppendLine();
                     output.AppendLine(target.Id + " · " + target.Host + " · " + target.Method + " · " + text(target.Method == "icmp" ? "monitorIcmp" : target.UseSystemProxy ? "monitorProxyFollow" : "monitorProxyDirect"));
                     if (latest != null)
@@ -1087,7 +1369,7 @@ namespace NetworkRescue
             if (!value.TryGetValue(key, out item) || !(item is int) || (int)item < minimum || (int)item > maximum) throw new InvalidDataException("Invalid request field: " + key);
             return (int)item;
         }
-        private void SendInit() { Emit(new { type = "init", language = I18n.Language, mode = mode, theme = theme, version = DisplayVersion, updateRepository = updateRepository, monitorGateway = NetworkChangeReader.FindGateway(), canSaveHealthProfile = CanSaveHealthProfile }); }
+        private void SendInit() { Emit(new { type = "init", language = I18n.Language, mode = mode, theme = theme, version = DisplayVersion, updateRepository = updateRepository, monitorGateway = NetworkChangeReader.FindGateway(), canSaveHealthProfile = CanSaveHealthProfile, trayEnabled = trayEnabled, trayMuted = trayMuted }); }
         private void SendReport()
         {
             PortalLoginInfo portal = PortalLogin.Inspect(report);
