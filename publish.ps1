@@ -45,8 +45,21 @@ foreach($taskRelative in $taskFiles.Keys) {
     $taskTotalBytes+=(Get-Item -LiteralPath $taskTarget).Length
 }
 if($taskTotalBytes -gt 10MB){throw 'The native portable package unexpectedly exceeds 10 MiB; inspect dependencies before publishing.'}
+Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-[IO.Compression.ZipFile]::CreateFromDirectory($taskStage,$taskPendingZip,[IO.Compression.CompressionLevel]::Optimal,$false)
+# Framework and modern .NET disagree about directory separators in CreateFromDirectory.
+# Create each allowlisted entry explicitly so every ZIP has portable forward-slash names.
+$taskZipWriter=[IO.Compression.ZipFile]::Open($taskPendingZip,[IO.Compression.ZipArchiveMode]::Create)
+try {
+    foreach($taskRelative in $taskFiles.Keys) {
+        $taskZipEntry=$taskZipWriter.CreateEntry($taskRelative,[IO.Compression.CompressionLevel]::Optimal)
+        $taskSourceStream=[IO.File]::OpenRead((Join-Path $taskStage $taskRelative))
+        try {
+            $taskEntryStream=$taskZipEntry.Open()
+            try {$taskSourceStream.CopyTo($taskEntryStream)} finally {$taskEntryStream.Dispose()}
+        } finally {$taskSourceStream.Dispose()}
+    }
+} finally {$taskZipWriter.Dispose()}
 $taskArchive=[IO.Compression.ZipFile]::OpenRead($taskPendingZip)
 try {
     $taskExpected=@($taskFiles.Keys|Sort-Object)

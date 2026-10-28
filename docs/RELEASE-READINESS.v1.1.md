@@ -47,6 +47,8 @@
 
 `publish.ps1` 校验程序集版本、PE 架构、ZIP 文件允许清单与逐项哈希；不把本机数据、修复备份或监测历史打入便携包。GitHub Actions 对同一提交再执行双架构 18 套检查，通过后生成正式 ZIP 和 SHA-256 文件。
 
+云端首轮两个架构的 18 套功能检查均通过；runner 具备文件符号链接权限，MonitoringHistory 为 59 项（本机为 55 项且明确跳过该权限项）。首次云端打包被严格白名单校验拦截：Windows PowerShell 5 / .NET Framework 的 `CreateFromDirectory` 写入反斜线 ZIP 路径。已改为按白名单显式创建正斜线条目，并显式加载压缩程序集；Windows PowerShell 5 与当前 pwsh 的 x64/x86 四种打包组合均通过 27 条目、零反斜线、版本/架构及逐文件哈希验证。不同压缩运行时的包字节和哈希可以不同，正式下载以发行所附 SHA256SUMS 为准。
+
 ## 验证边界
 
 - Windows 本机 x86 进程测试不等于纯 32 位 Windows 系统验收。
